@@ -49,6 +49,32 @@ defmodule AshAuthentication.Oauth2Server do
   | `:cimd_fetch_options` | `[]` | Keyword options passed to the fetcher's `fetch/2` — see `AshAuthentication.Oauth2Server.CIMD.ReqFetcher` for the default fetcher's options. |
   | `:sign_in_path` | `nil` | Path to redirect unauthenticated `/oauth/authorize` requests to. When `nil`, returns 401. |
   | `:initial_access_token` | `nil` | When set, `POST /oauth/register` requires the request to present a matching `Authorization: Bearer …` token (RFC 7591 §3). When `nil` (default), dynamic client registration is open — see the trust-model note below. |
+  | `:access_token_claims` | `nil` | Extra claims for each access token: a 1-arity function capture (`&MyApp.Claims.claims/1`) or an MFA tuple (`{Module, :function, [args]}`, called with the context prepended). See "Custom claims" below. |
+
+  ## Custom claims
+
+  `:access_token_claims` adds application claims to every access token that
+  the token endpoint mints, for both the `authorization_code` and the
+  `refresh_token` grant. It is called with a map:
+
+    * `:grant` — the authorization code or refresh token record that the
+      token is minted from, so attributes the app stores on its grant
+      resources (for example the tenant attribute) are available
+    * `:user_id`, `:client_id`, `:scope`, `:resource` — the values of the
+      `sub`, `client_id`, `scope` and `aud` claims
+    * `:tenant` — the Ash tenant of the request, or `nil`
+
+  It returns a map with string keys. The claims this server sets (`iss`,
+  `sub`, `aud`, `client_id`, `scope`, `iat`, `nbf`, `exp`, `jti` and
+  `tenant`) cannot be overridden: a returned value for one of them is
+  ignored.
+
+  ```elixir
+  access_token_claims: {MyApp.Oauth2Claims, :claims, []}
+
+  # in MyApp.Oauth2Claims
+  def claims(%{grant: grant}), do: %{"org" => grant.org_id}
+  ```
 
   ## Protected resources
 
@@ -219,7 +245,8 @@ defmodule AshAuthentication.Oauth2Server do
       cimd_fetcher: AshAuthentication.Oauth2Server.CIMD.ReqFetcher,
       cimd_fetch_options: [],
       sign_in_path: nil,
-      initial_access_token: nil
+      initial_access_token: nil,
+      access_token_claims: nil
     ]
   end
 
@@ -343,6 +370,13 @@ defmodule AshAuthentication.Oauth2Server do
           spec ->
             Oauth2Server.__resolve_secret__!(spec, __MODULE__, [:initial_access_token])
         end
+      end
+
+      @doc false
+      def access_token_claims(context) do
+        @oauth2_server_opts
+        |> Keyword.fetch!(:access_token_claims)
+        |> Oauth2Server.__resolve_claims__!(context)
       end
 
       def __oauth2_server__, do: true
@@ -707,6 +741,25 @@ defmodule AshAuthentication.Oauth2Server do
 
   defp ensure_scopes_list!(other, source),
     do: raise("#{inspect(source)} returned #{inspect(other)}, expected a list of scopes")
+
+  @doc false
+  # Resolve the `:access_token_claims` option for one token.
+  def __resolve_claims__!(nil, _context), do: %{}
+
+  def __resolve_claims__!(fun, context) when is_function(fun, 1),
+    do: ensure_claims_map!(fun.(context), fun)
+
+  def __resolve_claims__!({mod, fun, args} = mfa, context)
+      when is_atom(mod) and is_atom(fun) and is_list(args),
+      do: ensure_claims_map!(apply(mod, fun, [context | args]), mfa)
+
+  def __resolve_claims__!(other, _context),
+    do: raise(ArgumentError, "invalid `:access_token_claims` value: #{inspect(other)}")
+
+  defp ensure_claims_map!(claims, _source) when is_map(claims), do: claims
+
+  defp ensure_claims_map!(other, source),
+    do: raise("#{inspect(source)} returned #{inspect(other)}, expected a map of claims")
 
   @doc """
   Canonicalize a URL for redirect_uri / resource / issuer comparison.
