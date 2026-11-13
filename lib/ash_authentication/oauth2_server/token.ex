@@ -91,7 +91,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
              client_id: presented_client_id,
              scope: code.scope,
              audience: code.resource_uri,
-             tenant: tenant
+             tenant: tenant,
+             claims: custom_claims(server, code, presented_client_id, code.scope, tenant)
            ),
          {:ok, refresh_token} <- maybe_issue_refresh_token(server, client, code, opts) do
       touch_client(client, opts)
@@ -109,6 +110,19 @@ defmodule AshAuthentication.Oauth2Server.Token do
 
   defp secret_context(nil), do: %{}
   defp secret_context(tenant), do: %{tenant: tenant}
+
+  # The server's `:access_token_claims` for a token minted from `grant`, an
+  # authorization code or a refresh token row.
+  defp custom_claims(server, grant, presented_client_id, scope, tenant) do
+    server.access_token_claims(%{
+      grant: grant,
+      user_id: grant.user_id,
+      client_id: presented_client_id,
+      scope: scope,
+      resource: grant.resource_uri,
+      tenant: tenant
+    })
+  end
 
   # OAuth 2.1 §3.2: a parameter sent without a value counts as omitted. A
   # missing required parameter is `invalid_request` (§3.2.4), checked before
@@ -415,7 +429,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
              client_id: presented_client_id,
              scope: access_scope,
              audience: old_row.resource_uri,
-             tenant: tenant
+             tenant: tenant,
+             claims: custom_claims(server, old_row, presented_client_id, access_scope, tenant)
            ) do
       touch_client_by_id(server, old_row.client_id, opts)
 

@@ -275,6 +275,39 @@ defmodule Oauth2ServerTest.Server do
     dcr_enabled?: true
 end
 
+defmodule Oauth2ServerTest.Claims do
+  @moduledoc false
+
+  # Echoes the context it receives, and tries to override claims the server sets.
+  def claims(context, prefix) do
+    %{
+      "#{prefix}grant" => context.grant.__struct__ |> Module.split() |> List.last(),
+      "#{prefix}user_id" => context.user_id,
+      "#{prefix}scope" => context.scope,
+      "#{prefix}resource" => context.resource,
+      "sub" => "forged",
+      "tenant" => "forged"
+    }
+  end
+end
+
+defmodule Oauth2ServerTest.ClaimsServer do
+  @moduledoc false
+  use AshAuthentication.Oauth2Server,
+    otp_app: :ash_authentication_oauth2_server,
+    user_resource: Oauth2ServerTest.User,
+    issuer_url: {Oauth2ServerTest.Secrets, []},
+    resource_url: {Oauth2ServerTest.Secrets, []},
+    signing_secret: {Oauth2ServerTest.Secrets, []},
+    client_resource: Oauth2ServerTest.OAuthClient,
+    authorization_code_resource: Oauth2ServerTest.OAuthAuthorizationCode,
+    refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
+    consent_resource: Oauth2ServerTest.OAuthConsent,
+    scopes: ["mcp"],
+    dcr_enabled?: true,
+    access_token_claims: {Oauth2ServerTest.Claims, :claims, ["app_"]}
+end
+
 defmodule Oauth2ServerTest.MultiResourceServer do
   @moduledoc """
   Protects two resources on one host, `/mcp` and `/gql`, each with its own
