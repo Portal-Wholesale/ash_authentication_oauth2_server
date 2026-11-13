@@ -40,6 +40,8 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
       `"tenant"` claim so the resource server can re-set the Ash tenant
       on the conn via `BearerPlug`. Multi-tenant deployments need this;
       single-tenant deployments can ignore it.
+    * `:claims` — a map of extra claims with string keys. The claims above
+      take precedence over a key of the same name.
   """
   @spec mint(server :: module(), keyword()) ::
           {:ok, String.t(), map()} | {:error, term()}
@@ -66,6 +68,12 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
         "jti" => generate_jti()
       }
       |> maybe_put_tenant(tenant, server.user_resource())
+
+    claims =
+      opts
+      |> Keyword.get(:claims, %{})
+      |> Map.drop(["tenant"])
+      |> Map.merge(claims)
 
     signer = Joken.Signer.create(@signer_alg, server.signing_secret(secret_context))
 
