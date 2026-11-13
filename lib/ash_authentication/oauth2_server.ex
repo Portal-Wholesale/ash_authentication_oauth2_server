@@ -49,6 +49,7 @@ defmodule AshAuthentication.Oauth2Server do
   | `:cimd_fetch_options` | `[]` | Keyword options passed to the fetcher's `fetch/2` — see `AshAuthentication.Oauth2Server.CIMD.ReqFetcher` for the default fetcher's options. |
   | `:sign_in_path` | `nil` | Path to redirect unauthenticated `/oauth/authorize` requests to. When `nil`, returns 401. |
   | `:initial_access_token` | `nil` | When set, `POST /oauth/register` requires the request to present a matching `Authorization: Bearer …` token (RFC 7591 §3). When `nil` (default), dynamic client registration is open — see the trust-model note below. |
+  | `:consent_per_resource?` | `false` | Store consent per client, scope and protected resource, which lets several resources share scopes. See "Shared scopes" below. |
   | `:access_token_claims` | `nil` | Extra claims for each access token: a 1-arity function capture (`&MyApp.Claims.claims/1`) or an MFA tuple (`{Module, :function, [args]}`, called with the context prepended). See "Custom claims" below. |
 
   ## Custom claims
@@ -108,6 +109,31 @@ defmodule AshAuthentication.Oauth2Server do
   resource that the user did not see on the consent screen. Static scope
   lists are checked at compile time. Scope lists that functions compute are
   checked when an authorization request uses them.
+
+  ### Shared scopes
+
+  Set `consent_per_resource?: true` to let resources share scopes, for
+  example `openid` and `offline_access`. Consent is then stored per client,
+  scope and resource, so consent to a scope at one resource never covers
+  another. The consent resource needs a `:resource_uri` attribute that its
+  `:grant` action accepts, and its upsert identity must include it:
+
+  ```elixir
+  attribute :resource_uri, :string, allow_nil?: false, public?: true
+
+  create :grant do
+    upsert? true
+    upsert_identity :by_user_client_resource
+    accept [:user_id, :client_id, :scope, :resource_uri]
+  end
+
+  identities do
+    identity :by_user_client_resource, [:user_id, :client_id, :resource_uri]
+  end
+  ```
+
+  A request whose scopes all are shared then selects no single resource,
+  so it must send `resource`.
 
   Each grant is bound to one resource. A client selects it with the
   `resource` parameter (RFC 8707). If a client does not send `resource`, the
@@ -246,6 +272,7 @@ defmodule AshAuthentication.Oauth2Server do
       cimd_fetch_options: [],
       sign_in_path: nil,
       initial_access_token: nil,
+      consent_per_resource?: false,
       access_token_claims: nil
     ]
   end
@@ -259,6 +286,7 @@ defmodule AshAuthentication.Oauth2Server do
       # garbage-collection extension — see __verify_cimd_support__!/1. Deferred to
       # @after_verify so the client resource is fully compiled before we introspect it.
       @after_verify {Oauth2Server, :__verify_cimd_support__!}
+      @after_verify {Oauth2Server, :__verify_consent_per_resource__!}
 
       @oauth2_server_opts Keyword.merge(Oauth2Server.__default_opts__(), opts)
 
@@ -290,6 +318,10 @@ defmodule AshAuthentication.Oauth2Server do
         do: Keyword.fetch!(@oauth2_server_opts, :dcr_always_return_client_secret?)
 
       def cimd_enabled?, do: Keyword.fetch!(@oauth2_server_opts, :cimd_enabled?)
+
+      def consent_per_resource?,
+        do: Keyword.fetch!(@oauth2_server_opts, :consent_per_resource?)
+
       def cimd_fetcher, do: Keyword.fetch!(@oauth2_server_opts, :cimd_fetcher)
       def cimd_fetch_options, do: Keyword.fetch!(@oauth2_server_opts, :cimd_fetch_options)
 
@@ -442,7 +474,12 @@ defmodule AshAuthentication.Oauth2Server do
               "#{inspect(module)} configures a resource name in `:resources` more than once"
         end
 
-        validate_resource_scopes!(module, resources, Keyword.get(opts, :scopes, []))
+        validate_resource_scopes!(
+          module,
+          resources,
+          Keyword.get(opts, :scopes, []),
+          Keyword.get(opts, :consent_per_resource?, false)
+        )
 
       {true, {:ok, _}} ->
         raise CompileError,
@@ -473,10 +510,12 @@ defmodule AshAuthentication.Oauth2Server do
   # With more than one resource, every scope must belong to exactly one of
   # them (RFC 9068 §5). Consent is stored per client and scope, so a shared
   # scope would let consent for one resource cover another. Scope lists
-  # given as functions are checked when they are resolved.
-  defp validate_resource_scopes!(_module, [_single], _server_scopes), do: :ok
+  # given as functions are checked when they are resolved. With
+  # `consent_per_resource?` consent names its resource, so scopes may be
+  # shared.
+  defp validate_resource_scopes!(_module, [_single], _server_scopes, _per_resource?), do: :ok
 
-  defp validate_resource_scopes!(module, resources, server_scopes) do
+  defp validate_resource_scopes!(module, resources, server_scopes, per_resource?) do
     Enum.each(resources, fn {name, config} ->
       unless Keyword.has_key?(config, :scopes) do
         raise CompileError,
@@ -489,10 +528,10 @@ defmodule AshAuthentication.Oauth2Server do
     lists = Enum.map(resources, fn {name, config} -> {name, config[:scopes]} end)
 
     if Enum.all?(lists, fn {_name, scopes} -> is_list(scopes) end) do
-      __check_disjoint_scopes__!(module, lists, CompileError)
+      unless per_resource?, do: __check_disjoint_scopes__!(module, lists, CompileError)
 
       if is_list(server_scopes) do
-        case Enum.flat_map(lists, &elem(&1, 1)) -- server_scopes do
+        case Enum.uniq(Enum.flat_map(lists, &elem(&1, 1))) -- server_scopes do
           [] ->
             :ok
 
@@ -636,6 +675,27 @@ defmodule AshAuthentication.Oauth2Server do
 
           See `AshAuthentication.Oauth2Server.ClientResource`.
           """
+      end
+    end
+
+    :ok
+  end
+
+  @doc false
+  # Runs via @after_verify. With `consent_per_resource?` consent is keyed by
+  # resource, so the consent resource must store it. Without the attribute
+  # consent to a shared scope would cover every resource.
+  def __verify_consent_per_resource__!(module) do
+    if module.consent_per_resource?() do
+      consent_resource = module.consent_resource()
+      Code.ensure_compiled!(consent_resource)
+
+      unless Ash.Resource.Info.attribute(consent_resource, :resource_uri) do
+        raise CompileError,
+          description:
+            "#{inspect(module)} has `consent_per_resource?: true`, but its consent resource " <>
+              "(#{inspect(consent_resource)}) has no `:resource_uri` attribute. " <>
+              "See \"Shared scopes\" in `AshAuthentication.Oauth2Server`."
       end
     end
 

@@ -145,6 +145,10 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   Returns true ONLY when prior consent exists AND its scope is a superset of
   `requested_scope`. This prevents silent privilege expansion when a client
   later asks for more scopes than the user originally agreed to.
+
+  With `consent_per_resource?`, pass the resource of the request (the
+  `resource` of `validate_request/3`'s result) as the `:resource` option:
+  only consent to that resource counts.
   """
   @spec consented?(
           server :: module(),
@@ -162,6 +166,9 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
 
   @doc """
   Add `scope` to the consent of `user` for `client`.
+
+  With `consent_per_resource?`, the `:resource` option is required and the
+  consent is stored for that resource only.
   """
   @spec grant_consent!(
           server :: module(),
@@ -183,11 +190,10 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
           end
 
         resource
-        |> Ash.Changeset.for_create(:grant, %{
-          user_id: user.id,
-          client_id: client.id,
-          scope: scope
-        })
+        |> Ash.Changeset.for_create(
+          :grant,
+          consent_key(server, opts, %{user_id: user.id, client_id: client.id, scope: scope})
+        )
         |> Ash.create!(ash_opts(opts))
       end,
       Keyword.take(opts, [:tenant])
@@ -201,6 +207,7 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   defp stored_scope(server, user, client, opts, lock? \\ false) do
     server.consent_resource()
     |> Ash.Query.filter(user_id == ^user.id and client_id == ^client.id)
+    |> filter_consent_resource(consent_key(server, opts, %{}))
     |> maybe_lock(lock?)
     |> Ash.read_one(ash_opts(opts))
     |> case do
@@ -208,6 +215,29 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
       _ -> :error
     end
   end
+
+  # With `consent_per_resource?`, consent is keyed by user, client and
+  # resource. A missing resource raises rather than reading or writing
+  # consent that would cover every resource.
+  defp consent_key(server, opts, fields) do
+    if server.consent_per_resource?() do
+      case Keyword.get(opts, :resource) do
+        resource when is_binary(resource) and resource != "" ->
+          Map.put(fields, :resource_uri, resource)
+
+        _ ->
+          raise ArgumentError,
+                "#{inspect(server)} stores consent per resource, so the :resource option is required"
+      end
+    else
+      fields
+    end
+  end
+
+  defp filter_consent_resource(query, %{resource_uri: resource}),
+    do: Ash.Query.filter(query, resource_uri == ^resource)
+
+  defp filter_consent_resource(query, _key), do: query
 
   defp maybe_lock(query, true) do
     if Ash.DataLayer.data_layer_can?(query.resource, {:lock, :for_update}),
@@ -469,13 +499,16 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   end
 
   # Static scope lists are checked at compile time. This catches scope
-  # lists that functions compute.
+  # lists that functions compute. Consent per resource allows shared scopes.
   defp check_disjoint_scopes!(server) do
-    case server.resources() do
-      [_single] ->
+    case {server.resources(), server.consent_per_resource?()} do
+      {[_single], _per_resource?} ->
         :ok
 
-      names ->
+      {_names, true} ->
+        :ok
+
+      {names, false} ->
         Oauth2Server.__check_disjoint_scopes__!(
           server,
           Enum.map(names, &{&1, server.resource_scopes(&1)})

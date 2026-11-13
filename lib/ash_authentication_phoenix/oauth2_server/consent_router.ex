@@ -61,7 +61,13 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentRouter do
     with :ok <- check_state_size(params),
          {:ok, validated} <- Authorize.validate_request(server, params, tenant_opts),
          {:ok, user} <- require_user(conn) do
-      if Authorize.consented?(server, user, validated.client, validated.scope, tenant_opts) do
+      if Authorize.consented?(
+           server,
+           user,
+           validated.client,
+           validated.scope,
+           consent_opts(tenant_opts, validated)
+         ) do
         issue_code_redirect(conn, server, user, validated)
       else
         render_consent(conn, validated, opts)
@@ -103,7 +109,13 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentRouter do
          {:ok, user} <- require_user(conn) do
       case Map.get(raw_params, "action") do
         "approve" ->
-          Authorize.grant_consent!(server, user, validated.client, validated.scope, tenant_opts)
+          Authorize.grant_consent!(
+            server,
+            user,
+            validated.client,
+            validated.scope,
+            consent_opts(tenant_opts, validated)
+          )
 
           conn
           |> rotate_session()
@@ -133,6 +145,11 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentRouter do
   # ── shared helpers ────────────────────────────────────────────────────────
 
   defp server!(opts), do: Keyword.fetch!(opts, :oauth2_server)
+
+  # The resource of the request, for servers that store consent per resource.
+  defp consent_opts(tenant_opts, validated),
+    do: Keyword.put(tenant_opts, :resource, validated.resource)
+
   defp consent_view!(opts), do: Keyword.get(opts, :consent_view, ConsentView)
 
   defp require_user(conn) do

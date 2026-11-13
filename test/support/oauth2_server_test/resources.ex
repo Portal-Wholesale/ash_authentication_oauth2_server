@@ -227,6 +227,41 @@ defmodule Oauth2ServerTest.OAuthConsent do
   end
 end
 
+defmodule Oauth2ServerTest.OAuthResourceConsent do
+  @moduledoc "Consent keyed by user, client and resource, for `consent_per_resource?`."
+  use Ash.Resource,
+    domain: Oauth2ServerTest.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    uuid_v7_primary_key :id
+    attribute :user_id, :uuid_v7, allow_nil?: false, public?: true
+    attribute :client_id, :uuid_v7, allow_nil?: false, public?: true
+    attribute :resource_uri, :string, allow_nil?: false, public?: true
+    attribute :scope, :string, allow_nil?: false, public?: true
+
+    attribute :granted_at, :utc_datetime_usec,
+      allow_nil?: false,
+      public?: true,
+      default: &DateTime.utc_now/0
+  end
+
+  actions do
+    defaults [:read, :destroy]
+
+    create :grant do
+      upsert? true
+      upsert_identity :by_user_client_resource
+      accept [:user_id, :client_id, :scope, :resource_uri]
+    end
+  end
+
+  identities do
+    identity :by_user_client_resource, [:user_id, :client_id, :resource_uri],
+      pre_check_with: Oauth2ServerTest.Domain
+  end
+end
+
 defmodule Oauth2ServerTest.Domain do
   @moduledoc false
   use Ash.Domain
@@ -237,6 +272,7 @@ defmodule Oauth2ServerTest.Domain do
     resource Oauth2ServerTest.OAuthAuthorizationCode
     resource Oauth2ServerTest.OAuthRefreshToken
     resource Oauth2ServerTest.OAuthConsent
+    resource Oauth2ServerTest.OAuthResourceConsent
   end
 end
 
@@ -328,6 +364,30 @@ defmodule Oauth2ServerTest.MultiResourceServer do
     refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
     consent_resource: Oauth2ServerTest.OAuthConsent,
     scopes: ["mcp", "gql"],
+    dcr_enabled?: true
+end
+
+defmodule Oauth2ServerTest.SharedScopeServer do
+  @moduledoc """
+  `/mcp` and `/gql` share the identity scopes, with consent stored per
+  resource.
+  """
+
+  use AshAuthentication.Oauth2Server,
+    otp_app: :ash_authentication_oauth2_server,
+    user_resource: Oauth2ServerTest.User,
+    issuer_url: {Oauth2ServerTest.Secrets, []},
+    resources: [
+      mcp: [url: {Oauth2ServerTest.Secrets, []}, scopes: ["openid", "offline_access", "mcp"]],
+      gql: [url: {Oauth2ServerTest.Secrets, []}, scopes: ["openid", "offline_access", "gql"]]
+    ],
+    signing_secret: {Oauth2ServerTest.Secrets, []},
+    client_resource: Oauth2ServerTest.OAuthClient,
+    authorization_code_resource: Oauth2ServerTest.OAuthAuthorizationCode,
+    refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
+    consent_resource: Oauth2ServerTest.OAuthResourceConsent,
+    scopes: ["openid", "offline_access", "mcp", "gql"],
+    consent_per_resource?: true,
     dcr_enabled?: true
 end
 
