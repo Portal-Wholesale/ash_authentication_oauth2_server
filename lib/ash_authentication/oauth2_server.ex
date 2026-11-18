@@ -45,6 +45,7 @@ defmodule AshAuthentication.Oauth2Server do
   | `:dcr_enabled?` | `false` | Enable dynamic client registration (RFC 7591) at `POST /oauth/register`. Off by default — the safer posture for first-party-only apps. Turn on if you're hosting clients that self-register (MCP, ChatGPT Apps SDK, Claude.ai connectors). When off, the route 404s and the metadata document omits `registration_endpoint`. |
   | `:dcr_always_return_client_secret?` | `false` | Workaround for clients that misbehave when `client_secret` is absent for `auth_method: none`. The registration response then carries an empty `client_secret`. The token endpoint accepts that empty value in the request body, but answers `invalid_client` to any other client credentials, including an `Authorization: Basic` header (OAuth 2.1 §3.2.2). See https://community.openai.com/t/1366118 |
   | `:cimd_enabled?` | `false` | Accept HTTPS URLs as `client_id`s per the OAuth Client ID Metadata Documents draft — the registration mechanism the MCP spec (2026-07-28) recommends over DCR. Requires CIMD support on your client resource and (for the default fetcher) the optional `req` dependency. See `AshAuthentication.Oauth2Server.CIMD`. When on, the metadata document advertises `client_id_metadata_document_supported: true`. |
+  | `:client_assertion_resource` | `nil` | Turns on `private_key_jwt` for Client ID Metadata Document clients whose document declares it (keys from the document's `jwks` or `jwks_uri`). The resource stores each assertion `jti` until it expires so replays fail; it needs a `:record` create action accepting `client_id`, `jti` and `expires_at` and a unique identity on `[:client_id, :jti]`. Requires `cimd_enabled?: true`. See `AshAuthentication.Oauth2Server.ClientAssertion`. |
   | `:cimd_fetcher` | `AshAuthentication.Oauth2Server.CIMD.ReqFetcher` | Module implementing `AshAuthentication.Oauth2Server.CIMD.Fetcher` used to retrieve client metadata documents. Swap for a custom outbound policy or a test stub. |
   | `:cimd_fetch_options` | `[]` | Keyword options passed to the fetcher's `fetch/2` — see `AshAuthentication.Oauth2Server.CIMD.ReqFetcher` for the default fetcher's options. |
   | `:sign_in_path` | `nil` | Path to redirect unauthenticated `/oauth/authorize` requests to. When `nil`, returns 401. |
@@ -244,6 +245,7 @@ defmodule AshAuthentication.Oauth2Server do
       cimd_enabled?: false,
       cimd_fetcher: AshAuthentication.Oauth2Server.CIMD.ReqFetcher,
       cimd_fetch_options: [],
+      client_assertion_resource: nil,
       sign_in_path: nil,
       initial_access_token: nil,
       access_token_claims: nil
@@ -292,6 +294,12 @@ defmodule AshAuthentication.Oauth2Server do
       def cimd_enabled?, do: Keyword.fetch!(@oauth2_server_opts, :cimd_enabled?)
       def cimd_fetcher, do: Keyword.fetch!(@oauth2_server_opts, :cimd_fetcher)
       def cimd_fetch_options, do: Keyword.fetch!(@oauth2_server_opts, :cimd_fetch_options)
+
+      def client_assertion_resource,
+        do: Keyword.fetch!(@oauth2_server_opts, :client_assertion_resource)
+
+      def private_key_jwt_enabled?,
+        do: cimd_enabled?() and not is_nil(client_assertion_resource())
 
       def access_token_lifetime,
         do: Oauth2Server.__lifetime_seconds__(@oauth2_server_opts[:access_token_lifetime])

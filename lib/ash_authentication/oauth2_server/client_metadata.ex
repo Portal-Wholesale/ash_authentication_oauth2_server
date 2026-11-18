@@ -105,4 +105,52 @@ defmodule AshAuthentication.Oauth2Server.ClientMetadata do
     do: {:error, "invalid_client_metadata", "unsupported token_endpoint_auth_method"}
 
   def validate_auth_method(_), do: :ok
+
+  @doc """
+  Validate a Client ID Metadata Document's `token_endpoint_auth_method`.
+
+  With `allow_private_key_jwt?` the document may declare `private_key_jwt`
+  (draft-ietf-oauth-client-id-metadata-document §5). It must then carry
+  exactly one of `jwks_uri` (an `https` URL) or `jwks` (a key set), and any
+  `token_endpoint_auth_signing_alg` must be an accepted assertion algorithm.
+  The CIMD draft forbids the shared-secret methods, so they stay rejected.
+  """
+  @spec validate_cimd_auth_method(map(), boolean()) :: :ok | {:error, String.t(), String.t()}
+  def validate_cimd_auth_method(
+        %{"token_endpoint_auth_method" => "private_key_jwt"} = document,
+        true
+      ) do
+    with :ok <- validate_client_keys(document) do
+      validate_signing_alg(document)
+    end
+  end
+
+  def validate_cimd_auth_method(document, _allow_private_key_jwt?),
+    do: validate_auth_method(document)
+
+  defp validate_client_keys(%{"jwks_uri" => _, "jwks" => _}),
+    do: {:error, "invalid_client_metadata", "jwks_uri and jwks must not both be present"}
+
+  defp validate_client_keys(%{"jwks_uri" => "https://" <> _ = uri}) do
+    case URI.new(uri) do
+      {:ok, %URI{host: host, fragment: nil, userinfo: nil}} when is_binary(host) and host != "" ->
+        :ok
+
+      _ ->
+        {:error, "invalid_client_metadata", "jwks_uri must be an https URL"}
+    end
+  end
+
+  defp validate_client_keys(%{"jwks" => %{"keys" => [_ | _]}}), do: :ok
+
+  defp validate_client_keys(_),
+    do: {:error, "invalid_client_metadata", "private_key_jwt requires jwks_uri or jwks"}
+
+  defp validate_signing_alg(%{"token_endpoint_auth_signing_alg" => alg}) do
+    if alg in AshAuthentication.Oauth2Server.ClientAssertion.algorithms(),
+      do: :ok,
+      else: {:error, "invalid_client_metadata", "unsupported token_endpoint_auth_signing_alg"}
+  end
+
+  defp validate_signing_alg(_), do: :ok
 end
