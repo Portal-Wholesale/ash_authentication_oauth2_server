@@ -54,7 +54,8 @@ defmodule AshAuthentication.Oauth2Server.Metadata do
       "response_types_supported" => ["code"],
       "grant_types_supported" => ["authorization_code", "refresh_token"],
       "code_challenge_methods_supported" => ["S256"],
-      "token_endpoint_auth_methods_supported" => ["none"],
+      "token_endpoint_auth_methods_supported" =>
+        if(server.private_key_jwt_enabled?(), do: ["none", "private_key_jwt"], else: ["none"]),
       "scopes_supported" => server.scopes(),
       # RFC 9207 — we include `iss` in every authorization response, and
       # advertising that is a MUST once we do (RFC 9207 §2.3).
@@ -68,6 +69,11 @@ defmodule AshAuthentication.Oauth2Server.Metadata do
     # Clients check this before using a URL as their client_id (and fall
     # back to DCR / pre-registration when it's absent).
     |> put_if(server.cimd_enabled?(), "client_id_metadata_document_supported", true)
+    |> put_if(
+      server.private_key_jwt_enabled?(),
+      "token_endpoint_auth_signing_alg_values_supported",
+      AshAuthentication.Oauth2Server.ClientAssertion.algorithms()
+    )
   end
 
   defp put_if(map, true, key, value), do: Map.put(map, key, value)

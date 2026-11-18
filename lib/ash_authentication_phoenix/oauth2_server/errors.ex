@@ -172,6 +172,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Errors do
       :client_mismatch -> {400, "invalid_grant", "client mismatch"}
       :invalid_client -> {400, "invalid_client", "unknown client"}
       :unsupported_client_authentication -> {400, "invalid_client", "public client"}
+      :invalid_client_assertion -> {401, "invalid_client", "client authentication failed"}
       :unauthorized_client -> {400, "unauthorized_client", "grant type not registered"}
       :invalid_scope -> {400, "invalid_scope", "requested scope exceeds the grant"}
       :invalid_request -> {400, "invalid_request", "missing required parameters"}

@@ -105,7 +105,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
     ensure_client_resource_support!(server)
 
     with {:ok, document, source} <- get_document(server, url),
-         :ok <- validate_document(document, url) do
+         :ok <- validate_document(document, url, server.private_key_jwt_enabled?()) do
       # Cache only freshly fetched documents that passed validation. The CIMD
       # draft requires that the authorization server MUST NOT cache invalid or
       # malformed documents, so caching before validation (as it did before) let
@@ -196,17 +196,19 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
   """
   @spec validate_document(document :: map(), url :: String.t()) ::
           :ok | {:error, String.t()}
-  def validate_document(document, url) when is_map(document) do
+  def validate_document(document, url, allow_private_key_jwt? \\ false)
+
+  def validate_document(document, url, allow_private_key_jwt?) when is_map(document) do
     with :ok <- check_client_id(document, url),
          :ok <- check_client_name(document),
          :ok <- flatten(ClientMetadata.validate_redirect_uris(document)),
          :ok <- flatten(ClientMetadata.validate_grant_types(document)),
          :ok <- flatten(ClientMetadata.validate_response_types(document)) do
-      flatten(ClientMetadata.validate_auth_method(document))
+      flatten(ClientMetadata.validate_cimd_auth_method(document, allow_private_key_jwt?))
     end
   end
 
-  def validate_document(_, _), do: {:error, "metadata document must be a JSON object"}
+  def validate_document(_, _, _), do: {:error, "metadata document must be a JSON object"}
 
   defp check_client_id(%{"client_id" => client_id}, url) when client_id == url, do: :ok
 
@@ -231,6 +233,16 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
       token_endpoint_auth_method: Map.get(document, "token_endpoint_auth_method", "none"),
       scope: Enum.join(server.scopes(), " ")
     }
+
+    attrs =
+      if server.private_key_jwt_enabled?(),
+        do:
+          Map.merge(attrs, %{
+            jwks_uri: Map.get(document, "jwks_uri"),
+            jwks: Map.get(document, "jwks"),
+            token_endpoint_auth_signing_alg: Map.get(document, "token_endpoint_auth_signing_alg")
+          }),
+        else: attrs
 
     server.client_resource()
     |> Ash.Changeset.for_create(:register_cimd, attrs)
