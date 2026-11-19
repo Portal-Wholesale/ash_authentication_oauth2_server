@@ -73,7 +73,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
   def exchange_authorization_code(server, params, opts \\ []) do
     params = ClientAssertion.put_client_id(params)
 
-    with :ok <- require_params(params, ["client_id", "code", "code_verifier"]),
+    with :ok <- ClientAssertion.precheck(params, opts),
+         :ok <- require_params(params, ["client_id", "code", "code_verifier"]),
          {:ok, presented_client_id, client} <- resolve_client_id(server, params, opts),
          :ok <- ClientAssertion.authenticate(server, client, presented_client_id, params, opts),
          :ok <- check_grant_type(client, "authorization_code"),
@@ -278,7 +279,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
   def exchange_refresh_token(server, params, opts) do
     params = ClientAssertion.put_client_id(params)
 
-    with :ok <- require_params(params, ["client_id", "refresh_token"]),
+    with :ok <- ClientAssertion.precheck(params, opts),
+         :ok <- require_params(params, ["client_id", "refresh_token"]),
          :ok <- check_optional_string(params, "scope"),
          {:ok, presented_client_id, client} <- resolve_client_id(server, params, opts),
          :ok <- ClientAssertion.authenticate(server, client, presented_client_id, params, opts),
@@ -505,7 +507,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
   def revoke(server, params, opts \\ []) do
     params = ClientAssertion.put_client_id(params)
 
-    with :ok <- require_params(params, ["client_id", "token"]),
+    with :ok <- ClientAssertion.precheck(params, opts),
+         :ok <- require_params(params, ["client_id", "token"]),
          {:ok, presented, %{id: client_id} = client} <- resolve_client_id(server, params, opts),
          :ok <- ClientAssertion.authenticate(server, client, presented, params, opts) do
       token = params["token"]
