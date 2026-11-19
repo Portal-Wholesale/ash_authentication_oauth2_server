@@ -47,6 +47,16 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
   @ash_context %{private: %{ash_authentication?: true}}
   @jwks_cache_ttl 300
 
+  @doc """
+  Whether `server` accepts `private_key_jwt` from CIMD clients. Servers that
+  predate the option (or hand-written test doubles) answer `false`.
+  """
+  @spec enabled?(module()) :: boolean()
+  def enabled?(server) do
+    Code.ensure_loaded(server)
+    function_exported?(server, :private_key_jwt_enabled?, 0) and server.private_key_jwt_enabled?()
+  end
+
   @doc "The signing algorithms accepted for client assertions."
   @spec algorithms() :: [String.t()]
   def algorithms, do: @algorithms
@@ -68,6 +78,24 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
   end
 
   def put_client_id(params), do: params
+
+  @doc """
+  Checks that need no client: shared-secret credentials (HTTP Basic or
+  `client_secret`) are never accepted here, so they fail before the request is
+  validated, as they did before `private_key_jwt`. More than one mechanism is
+  `invalid_request`.
+  """
+  @spec precheck(map(), keyword()) :: :ok | {:error, atom()}
+  def precheck(params, opts) do
+    shared_secret? =
+      Keyword.get(opts, :authorization_scheme) == "basic" or present?(params["client_secret"])
+
+    case {credential_count(params, opts), shared_secret?} do
+      {n, _} when n > 1 -> {:error, :invalid_request}
+      {1, true} -> {:error, :unsupported_client_authentication}
+      _ -> :ok
+    end
+  end
 
   @doc """
   Authenticate `client` for a token or revocation request.

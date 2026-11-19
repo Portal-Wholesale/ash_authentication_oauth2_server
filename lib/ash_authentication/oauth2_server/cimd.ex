@@ -105,7 +105,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
     ensure_client_resource_support!(server)
 
     with {:ok, document, source} <- get_document(server, url),
-         :ok <- validate_document(document, url, server.private_key_jwt_enabled?()) do
+         :ok <- validate_document(document, url, AshAuthentication.Oauth2Server.ClientAssertion.enabled?(server)) do
       # Cache only freshly fetched documents that passed validation. The CIMD
       # draft requires that the authorization server MUST NOT cache invalid or
       # malformed documents, so caching before validation (as it did before) let
@@ -235,7 +235,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD do
     }
 
     attrs =
-      if server.private_key_jwt_enabled?(),
+      if AshAuthentication.Oauth2Server.ClientAssertion.enabled?(server),
         do:
           Map.merge(attrs, %{
             jwks_uri: Map.get(document, "jwks_uri"),
