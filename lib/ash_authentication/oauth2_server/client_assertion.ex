@@ -120,7 +120,6 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
     else
       0 -> {:error, :invalid_client_assertion}
       n when is_integer(n) -> {:error, :invalid_request}
-      {:error, :replay} -> {:error, :invalid_client_assertion}
       _ -> {:error, :invalid_client_assertion}
     end
   end
@@ -260,7 +259,8 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
     |> Ash.create(ash_opts(opts))
     |> case do
       {:ok, _} -> :ok
-      {:error, _} -> {:error, :replay}
+      # A replayed `jti` hits the unique identity.
+      {:error, _} -> {:error, :invalid_client_assertion}
     end
   end
 
