@@ -33,8 +33,10 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
   `jwks_uri` is fetched through the server's `:cimd_fetcher`, so the same
   outbound policy as the metadata document applies (HTTPS only, public
   addresses only, pinned connect, no redirects, size and time caps). Key sets
-  are cached like documents; an unknown `kid` refetches once, which picks up a
-  rotated key.
+  are cached like documents. An unknown `kid` refetches the set, which picks up
+  a rotated key, but at most once every 60 seconds for each `jwks_uri`, so
+  assertions with made-up `kid`s cannot turn the token endpoint into a stream
+  of fetches toward the client's key host.
   """
 
   require Logger
@@ -46,6 +48,7 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
   @max_lifetime 60 * 60
   @ash_context %{private: %{ash_authentication?: true}}
   @jwks_cache_ttl 300
+  @jwks_refetch_interval 60
 
   @doc """
   Whether `server` accepts `private_key_jwt` from CIMD clients. Servers that
@@ -181,14 +184,16 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
     _ -> {:error, :signature}
   end
 
-  # An unknown `kid` in a cached key set refetches the set once.
+  # An unknown `kid` in a cached key set refetches the set, at most once per
+  # `@jwks_refetch_interval` for the client's `jwks_uri`.
   defp select_key(keys, header, alg, source, server, client) do
     case find_key(keys, header, alg) do
       {:ok, jwk} ->
         {:ok, jwk}
 
       :error when source == :cached ->
-        with {:ok, fresh, _} <- client_keys(server, client, true),
+        with true <- refetch_allowed?(client),
+             {:ok, fresh, _} <- client_keys(server, client, true),
              {:ok, jwk} <- find_key(fresh, header, alg) do
           {:ok, jwk}
         else
@@ -197,6 +202,20 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
 
       :error ->
         {:error, :no_key}
+    end
+  end
+
+  # A key set is only `:cached` when the cache is running, so the mark is kept.
+  defp refetch_allowed?(%{jwks_uri: uri}) do
+    key = "jwks-refetch:" <> uri
+
+    case Cache.get(key) do
+      {:ok, _} ->
+        false
+
+      :miss ->
+        Cache.put(key, %{}, @jwks_refetch_interval)
+        true
     end
   end
 

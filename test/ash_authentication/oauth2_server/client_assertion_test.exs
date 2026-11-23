@@ -194,6 +194,28 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertionTest do
       assert {:error, :invalid_client_assertion} =
                authenticate(client, sign(ec, %{"alg" => "ES256"}, claims()))
     end
+
+    test "unknown kids refetch the key set at most once a minute", %{ec: ec, client: client} do
+      start_supervised!({CIMD.Cache, []})
+
+      # The first assertion fetches and caches the set; a known kid uses it.
+      assert :ok = authenticate(client, sign(ec, %{"alg" => "ES256", "kid" => "k1"}, claims()))
+      assert :ok = authenticate(client, sign(ec, %{"alg" => "ES256", "kid" => "k1"}, claims()))
+      assert_received {:stub_fetch, @jwks_uri}
+      refute_received {:stub_fetch, @jwks_uri}
+
+      # An unknown kid refetches once (a rotated key); the next ones do not.
+      for kid <- ["unknown-1", "unknown-2", "unknown-3"] do
+        assert {:error, :invalid_client_assertion} =
+                 authenticate(client, sign(ec, %{"alg" => "ES256", "kid" => kid}, claims()))
+      end
+
+      assert_received {:stub_fetch, @jwks_uri}
+      refute_received {:stub_fetch, @jwks_uri}
+
+      # The cached set still verifies a known kid.
+      assert :ok = authenticate(client, sign(ec, %{"alg" => "ES256", "kid" => "k1"}, claims()))
+    end
   end
 
   describe "jti replay" do

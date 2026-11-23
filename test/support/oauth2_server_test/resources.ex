@@ -430,6 +430,9 @@ defmodule Oauth2ServerTest.StubFetcher do
 
   @impl true
   def fetch(url, _opts) do
+    # Tests that count fetches assert on this message.
+    send(self(), {:stub_fetch, url})
+
     :ash_authentication_oauth2_server
     |> Application.get_env(@env_key, %{})
     |> Map.get(url)
