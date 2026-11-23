@@ -182,6 +182,12 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       {w1, w2, w3, w4} == {0x100, 0, 0, 0} or {w1, w2} == {0x2001, 0xDB8} ->
         false
 
+      # 2001::/23 IETF protocol assignments (Teredo, benchmarking, ORCHID,
+      # ...). A few anycast blocks inside it are routable, but none serves
+      # client metadata, so the whole block is refused.
+      w1 == 0x2001 and w2 < 0x200 ->
+        false
+
       # fc00::/7 unique-local, fe80::/9 link-local + deprecated site-local
       # (fec0::/10, RFC 3879), ff00::/8 multicast
       Bitwise.band(w1, 0xFE00) == 0xFC00 or
