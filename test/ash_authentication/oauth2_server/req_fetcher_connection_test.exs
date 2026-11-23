@@ -88,4 +88,25 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcherConnectionTest do
     assert finch_pools() == pools
     assert :erlang.system_info(:atom_count) == atoms
   end
+
+  test "a server that drips its body is cut off at the total deadline" do
+    # Each byte comes well inside the per-read timeout; the whole body
+    # would take 4 s.
+    port =
+      start_server(fn socket ->
+        :gen_tcp.send(socket, "HTTP/1.1 200 OK\r\ncontent-length: 200\r\n\r\n")
+
+        Enum.reduce_while(1..200, :ok, fn _, :ok ->
+          Process.sleep(20)
+          if :gen_tcp.send(socket, " ") == :ok, do: {:cont, :ok}, else: {:halt, :closed}
+        end)
+      end)
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:error, %Req.TransportError{reason: :timeout}} =
+             get(port, "slow.example.net", request_timeout: 300, receive_timeout: 1_000)
+
+    assert System.monotonic_time(:millisecond) - started < 1_000
+  end
 end

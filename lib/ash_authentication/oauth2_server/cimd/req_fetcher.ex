@@ -29,8 +29,10 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       CIMD document is served directly at its `client_id` URL.
     * **Bounded response** — the body is capped at `:max_body_bytes`
       (default 5 KiB, the size the CIMD draft recommends servers limit
-      reads to) and the request at `:receive_timeout` / `:connect_timeout`
-      (default 5s each).
+      reads to), each step at `:connect_timeout` / `:receive_timeout`, and
+      the whole fetch, DNS included, at `:request_timeout` (default 5s
+      each). The per-read timeout alone would let a server that sends a
+      byte at a time hold the caller for hours.
 
   Requires the optional `:req` dependency:
 
@@ -40,7 +42,11 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
 
     * `:max_body_bytes` — response size cap (default `5_120`)
     * `:connect_timeout` — TCP/TLS connect timeout in ms (default `5_000`)
-    * `:receive_timeout` — response receive timeout in ms (default `5_000`)
+    * `:receive_timeout` — timeout for each read of the response in ms
+      (default `5_000`)
+    * `:request_timeout` — total time for the fetch in ms, from DNS to the
+      last byte (default `5_000`). A fetch past it fails with
+      `%Req.TransportError{reason: :timeout}`.
     * `:allowed_ports` — permitted URL ports (default `[443]`)
     * `:allow_non_public_ips?` — skip the address validation entirely
       (default `false`). **Never enable this in production** — it exists
@@ -55,12 +61,23 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
 
   @impl true
   def fetch(url, opts \\ []) do
+    deadline = deadline(opts)
+
     with :ok <- ensure_req!(),
          {:ok, uri} <- validate_url(url, opts),
-         {:ok, ip} <- resolve_and_validate(uri.host, opts) do
-      do_fetch(uri, ip, opts)
+         {:ok, ip} <- resolve_and_validate(uri.host, deadline, opts) do
+      get(pinned_url(uri, ip), uri.host, deadline, opts)
     end
   end
+
+  @doc false
+  # Public for tests. The monotonic time (ms) by which a fetch started now
+  # must finish.
+  def deadline(opts),
+    do:
+      System.monotonic_time(:millisecond) + Keyword.get(opts, :request_timeout, @default_timeout)
+
+  defp remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   # ── URL shape ──────────────────────────────────────────────────────────────
 
@@ -91,11 +108,11 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
 
   # ── address validation ─────────────────────────────────────────────────────
 
-  defp resolve_and_validate(host, opts) do
+  defp resolve_and_validate(host, deadline, opts) do
     if Keyword.get(opts, :allow_non_public_ips?, false) do
-      resolve_first(host)
+      resolve_first(host, deadline)
     else
-      with {:ok, ips} <- resolve_all(host) do
+      with {:ok, ips} <- resolve_all(host, deadline) do
         # Reject the host outright if ANY of its addresses is non-public.
         # A host that mixes public and private records is exactly the
         # shape a rebinding/multi-record attack takes.
@@ -106,11 +123,11 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
     end
   end
 
-  defp resolve_first(host) do
-    with {:ok, [ip | _]} <- resolve_all(host), do: {:ok, ip}
+  defp resolve_first(host, deadline) do
+    with {:ok, [ip | _]} <- resolve_all(host, deadline), do: {:ok, ip}
   end
 
-  defp resolve_all(host) do
+  defp resolve_all(host, deadline) do
     charlist = String.to_charlist(host)
 
     case :inet.parse_address(charlist) do
@@ -118,17 +135,17 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
         {:ok, [ip]}
 
       {:error, _} ->
-        v4 = getaddrs(charlist, :inet)
+        v4 = getaddrs(charlist, :inet, deadline)
         # Prefer IPv4 for the pinned connect; fall back to IPv6-only hosts.
-        case v4 ++ getaddrs(charlist, :inet6) do
+        case v4 ++ getaddrs(charlist, :inet6, deadline) do
           [] -> {:error, :nxdomain}
           ips -> {:ok, Enum.uniq(ips)}
         end
     end
   end
 
-  defp getaddrs(charlist, family) do
-    case :inet.getaddrs(charlist, family) do
+  defp getaddrs(charlist, family, deadline) do
+    case :inet.getaddrs(charlist, family, remaining(deadline)) do
       {:ok, ips} -> ips
       {:error, _} -> []
     end
@@ -208,13 +225,10 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
 
   # ── the request itself ─────────────────────────────────────────────────────
 
-  defp do_fetch(uri, ip, opts), do: get(pinned_url(uri, ip), uri.host, deadline(opts), opts)
-
   @doc false
-  def deadline(_opts), do: nil
-
-  @doc false
-  def get(url, hostname, _deadline, opts) do
+  # Public for tests. GETs `url`, whose host is the validated IP, by
+  # `deadline` (see `deadline/1`).
+  def get(url, hostname, deadline, opts) do
     max_body = Keyword.get(opts, :max_body_bytes, @default_max_body_bytes)
 
     request =
@@ -233,6 +247,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
         # Connect to the validated IP, but keep TLS verification, SNI,
         # and the Host header on the original hostname.
         hostname: hostname,
+        deadline: deadline,
         connect_timeout: Keyword.get(opts, :connect_timeout, @default_timeout),
         receive_timeout: Keyword.get(opts, :receive_timeout, @default_timeout)
       })

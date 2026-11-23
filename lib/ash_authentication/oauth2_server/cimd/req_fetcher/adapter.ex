@@ -13,9 +13,11 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher.Adapter do
   # behind for the life of the node. A connection here lives only as long as
   # its request, and nothing is named after the host.
   #
-  # Reads `:hostname` (TLS verification, SNI and the Host header) and
-  # `:connect_timeout` and `:receive_timeout` (ms) from the request's
-  # `:cimd_fetch` private field. The URL's host is the validated IP literal.
+  # Reads `:hostname` (TLS verification, SNI and the Host header),
+  # `:connect_timeout` and `:receive_timeout` (ms), and `:deadline` (the
+  # monotonic ms by which the whole response must be read) from the
+  # request's `:cimd_fetch` private field. The URL's host is the validated IP
+  # literal.
 
   @private :cimd_fetch
 
@@ -24,21 +26,27 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher.Adapter do
     url = request.url
     {:ok, ip} = url.host |> String.to_charlist() |> :inet.parse_address()
 
-    connect_opts = [
-      hostname: hostname,
-      mode: :passive,
-      protocols: [:http1],
-      transport_opts: [timeout: settings.connect_timeout]
-    ]
+    with {:ok, timeout} <- timeout(settings.connect_timeout, settings.deadline),
+         connect_opts = [
+           hostname: hostname,
+           mode: :passive,
+           protocols: [:http1],
+           transport_opts: [timeout: timeout]
+         ],
+         {:ok, conn} <- Mint.HTTP.connect(scheme(url), ip, url.port, connect_opts) do
+      {conn, result} = send_and_receive(conn, request, settings)
+      Mint.HTTP.close(conn)
+      {request, result}
+    else
+      {:error, error} -> {request, exception(error)}
+    end
+  end
 
-    case Mint.HTTP.connect(scheme(url), ip, url.port, connect_opts) do
-      {:ok, conn} ->
-        {conn, result} = send_and_receive(conn, request, settings)
-        Mint.HTTP.close(conn)
-        {request, result}
-
-      {:error, error} ->
-        {request, exception(error)}
+  # A step's timeout, cut to what is left before the deadline.
+  defp timeout(step_timeout, deadline) do
+    case deadline - System.monotonic_time(:millisecond) do
+      left when left > 0 -> {:ok, min(step_timeout, left)}
+      _ -> {:error, %Req.TransportError{reason: :timeout}}
     end
   end
 
@@ -61,15 +69,15 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher.Adapter do
   end
 
   defp receive_response(conn, ref, acc, settings) do
-    case Mint.HTTP.recv(conn, 0, settings.receive_timeout) do
-      {:ok, conn, responses} ->
-        case handle(responses, ref, acc) do
-          {:cont, acc} -> receive_response(conn, ref, acc, settings)
-          {:done, {_request, response}} -> {conn, response}
-        end
-
-      {:error, conn, error, _responses} ->
-        {conn, exception(error)}
+    with {:ok, timeout} <- timeout(settings.receive_timeout, settings.deadline),
+         {:ok, conn, responses} <- Mint.HTTP.recv(conn, 0, timeout) do
+      case handle(responses, ref, acc) do
+        {:cont, acc} -> receive_response(conn, ref, acc, settings)
+        {:done, {_request, response}} -> {conn, response}
+      end
+    else
+      {:error, error} -> {conn, error}
+      {:error, conn, error, _responses} -> {conn, exception(error)}
     end
   end
 
@@ -99,6 +107,7 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher.Adapter do
   defp handle([{:done, ref} | _rest], ref, acc), do: {:done, acc}
   defp handle([_other | rest], ref, acc), do: handle(rest, ref, acc)
 
+  defp exception(%Req.TransportError{} = error), do: error
   defp exception(%Mint.TransportError{reason: reason}), do: %Req.TransportError{reason: reason}
 
   defp exception(%Mint.HTTPError{reason: reason}),
