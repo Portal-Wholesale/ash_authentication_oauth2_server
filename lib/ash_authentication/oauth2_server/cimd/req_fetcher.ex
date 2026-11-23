@@ -34,6 +34,14 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       each). The per-read timeout alone would let a server that sends a
       byte at a time hold the caller for hours.
 
+  ## Errors
+
+  A failure the client may recover from by retrying (a resolver timeout or
+  SERVFAIL, a refused or dropped connection, the deadline) is a
+  `%Req.TransportError{}`. `:nxdomain` means the name has no address. The
+  other errors (`:non_public_address`, `{:http_status, status}`,
+  `:document_too_large`, ...) describe the URL or the response.
+
   Requires the optional `:req` dependency:
 
       {:req, "~> 0.5"}
@@ -135,19 +143,33 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
         {:ok, [ip]}
 
       {:error, _} ->
-        v4 = getaddrs(charlist, :inet, deadline)
         # Prefer IPv4 for the pinned connect; fall back to IPv6-only hosts.
-        case v4 ++ getaddrs(charlist, :inet6, deadline) do
-          [] -> {:error, :nxdomain}
-          ips -> {:ok, Enum.uniq(ips)}
-        end
+        dns_result([
+          :inet.getaddrs(charlist, :inet, remaining(deadline)),
+          :inet.getaddrs(charlist, :inet6, remaining(deadline))
+        ])
     end
   end
 
-  defp getaddrs(charlist, family, deadline) do
-    case :inet.getaddrs(charlist, family, remaining(deadline)) do
-      {:ok, ips} -> ips
-      {:error, _} -> []
+  @doc false
+  # Public for tests. Combines the IPv4 and IPv6 lookups. Only a name that
+  # does not exist (or has no address) is `:nxdomain`. A resolver timeout,
+  # SERVFAIL or the like is a `Req.TransportError`, the error a transport
+  # failure takes, so callers can treat it as transient (CIMD §6.1) rather
+  # than as a client that is gone.
+  def dns_result(lookups) do
+    case for({:ok, ips} <- lookups, ip <- ips, do: ip) do
+      [] ->
+        case Enum.reject(
+               for({:error, reason} <- lookups, do: reason),
+               &(&1 in [:nxdomain, :einval])
+             ) do
+          [] -> {:error, :nxdomain}
+          [reason | _] -> {:error, %Req.TransportError{reason: reason}}
+        end
+
+      ips ->
+        {:ok, Enum.uniq(ips)}
     end
   end
 

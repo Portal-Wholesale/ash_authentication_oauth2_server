@@ -109,4 +109,22 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcherTest do
 
     refute_received {:requested, _}
   end
+
+  test "a failed DNS lookup is transient unless the name has no address" do
+    v4 = {93, 184, 216, 34}
+    v6 = {0x2606, 0x2800, 0x220, 0x1, 0x248, 0x1893, 0x25C8, 0x1946}
+
+    assert {:ok, [^v4, ^v6]} = ReqFetcher.dns_result([{:ok, [v4]}, {:ok, [v6]}])
+    # An IPv6-only host: IPv4 has no records.
+    assert {:ok, [^v6]} = ReqFetcher.dns_result([{:error, :nxdomain}, {:ok, [v6]}])
+    assert {:error, :nxdomain} = ReqFetcher.dns_result([{:error, :nxdomain}, {:error, :nxdomain}])
+
+    for reason <- [:timeout, :servfail, :refused, :try_again] do
+      assert {:error, %Req.TransportError{reason: ^reason}} =
+               ReqFetcher.dns_result([{:error, reason}, {:error, :nxdomain}])
+
+      assert {:error, %Req.TransportError{reason: ^reason}} =
+               ReqFetcher.dns_result([{:error, :nxdomain}, {:error, reason}])
+    end
+  end
 end
