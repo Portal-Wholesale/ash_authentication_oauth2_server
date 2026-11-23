@@ -127,4 +127,35 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcherTest do
                ReqFetcher.dns_result([{:error, :nxdomain}, {:error, reason}])
     end
   end
+
+  test "local-use NAT64, documentation, SRv6 and other non-global IPv6 blocks are refused" do
+    for ip <- [
+          # 64:ff9b:1::/48, local-use NAT64 (RFC 8215), which can reach private IPv4
+          {0x64, 0xFF9B, 0x1, 0, 0, 0, 0x0A00, 0x0001},
+          {0x64, 0xFF9B, 0x1, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
+          # 3fff::/20, documentation (RFC 9637)
+          {0x3FFF, 0, 0, 0, 0, 0, 0, 1},
+          {0x3FFF, 0x0FFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF},
+          # 5f00::/16, SRv6 SIDs (RFC 9602)
+          {0x5F00, 0, 0, 0, 0, 0, 0, 1},
+          # outside 2000::/3, where no global unicast address is assigned
+          {0x4000, 0, 0, 0, 0, 0, 0, 1},
+          {0x1, 0, 0, 0, 0, 0, 0, 1},
+          {0xE000, 0, 0, 0, 0, 0, 0, 1}
+        ] do
+      refute ReqFetcher.public_ip?(ip), "expected #{inspect(ip)} to be rejected"
+    end
+
+    for ip <- [
+          # just past 3fff::/20
+          {0x3FFF, 0x1000, 0, 0, 0, 0, 0, 1},
+          # global unicast in use
+          {0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111},
+          {0x2A00, 0x1450, 0x4001, 0x80B, 0, 0, 0, 0x200E},
+          # well-known NAT64 with a public IPv4 is still re-checked, not refused
+          {0x64, 0xFF9B, 0, 0, 0, 0, 0x5DB8, 0xD822}
+        ] do
+      assert ReqFetcher.public_ip?(ip), "expected #{inspect(ip)} to be accepted"
+    end
+  end
 end

@@ -18,7 +18,8 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       link-local (including the cloud metadata range `169.254.0.0/16`),
       CGNAT, multicast, reserved ranges, and their IPv6 equivalents
       (including v4-mapped/NAT64/6to4 forms, whose embedded IPv4 is
-      re-checked) are all rejected.
+      re-checked) are all rejected. An IPv6 address must be in global
+      unicast (`2000::/3`) outside its documentation and IETF blocks.
     * **Pinned connect** — the request connects to the *validated IP*
       while keeping TLS verification, SNI, and the `Host` header on the
       original hostname (Mint's `:hostname` option). This closes the
@@ -219,8 +220,8 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       w1 == 0x2002 ->
         public_ip?(embedded_v4(w2, w3))
 
-      # 100::/64 discard, 2001:db8::/32 documentation
-      {w1, w2, w3, w4} == {0x100, 0, 0, 0} or {w1, w2} == {0x2001, 0xDB8} ->
+      # 2001:db8::/32 and 3fff::/20 documentation (RFC 9637)
+      {w1, w2} == {0x2001, 0xDB8} or (w1 == 0x3FFF and w2 < 0x1000) ->
         false
 
       # 2001::/23 IETF protocol assignments (Teredo, benchmarking, ORCHID,
@@ -229,15 +230,13 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       w1 == 0x2001 and w2 < 0x200 ->
         false
 
-      # fc00::/7 unique-local, fe80::/9 link-local + deprecated site-local
-      # (fec0::/10, RFC 3879), ff00::/8 multicast
-      Bitwise.band(w1, 0xFE00) == 0xFC00 or
-        Bitwise.band(w1, 0xFF80) == 0xFE80 or
-          Bitwise.band(w1, 0xFF00) == 0xFF00 ->
-        false
-
+      # Global unicast is 2000::/3. Everything outside it that the clauses
+      # above did not re-check is not publicly routable: 100::/64 discard,
+      # 64:ff9b:1::/48 local-use NAT64 (RFC 8215, which can reach private
+      # IPv4), 5f00::/16 SRv6 SIDs, fc00::/7 unique-local, fe80::/10
+      # link-local, ff00::/8 multicast, and the unassigned rest.
       true ->
-        true
+        Bitwise.band(w1, 0xE000) == 0x2000
     end
   end
 
