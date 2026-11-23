@@ -137,6 +137,36 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertionTest do
       end
     end
 
+    test "typ may be absent, JWT or client-authentication+jwt; another token type is refused",
+         %{ec: ec, client: client} do
+      header = %{"alg" => "ES256", "kid" => "k1"}
+
+      # `JOSE.JWT.sign/3` adds `typ: JWT` to a header without one.
+      sign_typ = fn
+        nil ->
+          {_, token} = ec |> JOSE.JWS.sign(Jason.encode!(claims()), header) |> JOSE.JWS.compact()
+          token
+
+        typ ->
+          sign(ec, Map.put(header, "typ", typ), claims())
+      end
+
+      for typ <- [
+            nil,
+            "JWT",
+            "jwt",
+            "client-authentication+jwt",
+            "application/client-authentication+jwt"
+          ] do
+        assert :ok = authenticate(client, sign_typ.(typ)), "expected typ #{inspect(typ)} to pass"
+      end
+
+      for typ <- ["at+jwt", "application/at+jwt", "dpop+jwt", "secevent+jwt", "JOSE", ""] do
+        assert {:error, :invalid_client_assertion} = authenticate(client, sign_typ.(typ)),
+               "expected typ #{inspect(typ)} to be refused"
+      end
+    end
+
     test "alg none is refused", %{client: client} do
       encode = &Base.url_encode64(Jason.encode!(&1), padding: false)
       unsigned = encode.(%{"alg" => "none", "kid" => "k1"}) <> "." <> encode.(claims()) <> "."

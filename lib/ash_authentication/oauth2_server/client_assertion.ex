@@ -18,6 +18,9 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
 
     * `client_assertion_type` is `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
       and no other credential is present;
+    * its `typ`, if present, is `JWT` or `client-authentication+jwt`
+      (draft-ietf-oauth-rfc7523bis), so a JWT the client signed as another
+      token type is not taken for an assertion;
     * its `alg` is in `#{inspect(~w(RS256 RS384 RS512 PS256 PS384 PS512 ES256 ES384 EdDSA))}`
       (and equals the document's `token_endpoint_auth_signing_alg` when the
       document names one), so `none` and the HMAC algorithms never verify;
@@ -151,6 +154,7 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
          @assertion_type <- params["client_assertion_type"],
          assertion when is_binary(assertion) and assertion != "" <- params["client_assertion"],
          {:ok, header} <- peek_header(assertion),
+         :ok <- check_typ(header),
          {:ok, alg} <- check_alg(header, client),
          {:ok, claims} <- verify_signature(server, client, assertion, alg, header),
          :ok <- check_claims(server, claims, client_id, opts) do
@@ -161,6 +165,20 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
       _ -> {:error, :invalid_client_assertion}
     end
   end
+
+  # The rfc7523bis value is not required: clients in use today, ChatGPT among
+  # them, may send `JWT` or no `typ` at all. Media types are case-insensitive
+  # and may carry the `application/` prefix (RFC 7515 §4.1.9).
+  defp check_typ(%{"typ" => typ}) when is_binary(typ) do
+    case String.downcase(typ) do
+      "application/" <> type when type in ["jwt", "client-authentication+jwt"] -> :ok
+      type when type in ["jwt", "client-authentication+jwt"] -> :ok
+      _ -> {:error, :typ}
+    end
+  end
+
+  defp check_typ(%{"typ" => _}), do: {:error, :typ}
+  defp check_typ(_header), do: :ok
 
   defp check_alg(%{"alg" => alg}, client) when alg in @algorithms do
     case Map.get(client, :token_endpoint_auth_signing_alg) do
