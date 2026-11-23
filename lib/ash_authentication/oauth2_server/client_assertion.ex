@@ -30,8 +30,9 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
       the token endpoint, `exp` is in the future and at most
       `#{60 * 60}` seconds away, and `nbf`/`iat` are not in the future;
     * its `jti` was not seen before for this client. Each `jti` is stored in the
-      server's `:client_assertion_resource` until the assertion expires, so a
-      replay on any node fails.
+      server's `:client_assertion_resource` until the assertion expires plus the
+      clock skew it is accepted with, so a replay on any node fails even after
+      expired rows are pruned.
 
   `jwks_uri` is fetched through the server's `:cimd_fetcher`, so the same
   outbound policy as the metadata document applies (HTTPS only, public
@@ -319,11 +320,14 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
   defp not_after?(value, limit) when is_integer(value), do: value <= limit
   defp not_after?(_, _), do: false
 
+  # The row outlives the assertion by the clock skew `check_claims/4` allows
+  # past `exp`, so pruning expired rows never reopens a `jti` that would still
+  # verify.
   defp record_jti(server, client, claims, opts) do
     attrs = %{
       client_id: client.id,
       jti: claims["jti"],
-      expires_at: DateTime.from_unix!(claims["exp"])
+      expires_at: DateTime.from_unix!(claims["exp"] + server.clock_skew_seconds())
     }
 
     server.client_assertion_resource()

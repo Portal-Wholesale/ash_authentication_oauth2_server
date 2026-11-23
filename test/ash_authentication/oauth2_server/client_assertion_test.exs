@@ -272,6 +272,16 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertionTest do
       assert :ok = authenticate(client, sign(ec, header, %{first | "jti" => "fresh"}))
     end
 
+    test "the jti is kept until exp plus the accepted clock skew", %{ec: ec, client: client} do
+      first = claims()
+      assert :ok = authenticate(client, sign(ec, %{"alg" => "ES256", "kid" => "k1"}, first))
+
+      assert {:ok, [row]} = Ash.read(OAuthClientAssertion)
+      skew = PrivateKeyJwtServer.clock_skew_seconds()
+      assert skew > 0
+      assert DateTime.to_unix(row.expires_at) == first["exp"] + skew
+    end
+
     test "a store error while recording the jti is a server error", %{ec: ec} do
       client =
         register(FailingJtiServer, %{"jwks" => %{"keys" => [public_jwk(ec, "k1")]}})
