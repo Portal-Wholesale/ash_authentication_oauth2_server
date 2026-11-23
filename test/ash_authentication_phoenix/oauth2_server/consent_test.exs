@@ -179,7 +179,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
       for conn <- [
             conn(:get, "/oauth/authorize?" <> URI.encode_query(context.params)),
             conn(:post, "/oauth/authorize", %{
-              "consent_request" => sign(context.params),
+              "consent_request" => seal(context, context.params),
               "action" => "approve"
             })
           ] do
@@ -203,7 +203,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
 
     test "parses POST bodies and ignores unsealed protocol fields", context do
       form = %{
-        "consent_request" => sign(context.params),
+        "consent_request" => seal(context, context.params),
         "action" => "approve",
         "selection" => "workspace-a",
         "client_id" => "other-client",
@@ -236,13 +236,13 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
           "workspace_id" => "not-an-oauth-parameter"
         })
 
-      {:ok, _conn, request} = prepare_post(context, sign(payload))
+      {:ok, _conn, request} = prepare_post(context, seal(context, payload))
       assert request.validated.code_challenge == context.params["code_challenge"]
       refute Map.has_key?(request.validated, :workspace_id)
     end
 
     test "validates again after token verification", context do
-      token = sign(context.params)
+      token = seal(context, context.params)
       Ash.destroy!(context.client)
       {:halt, conn} = prepare_post(context, token)
       assert conn.status == 400
@@ -252,7 +252,15 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "rejects missing, empty, malformed, non-string and modified tokens", context do
-      for token <- [nil, "", "tampered", 123, %{}, [], sign(context.params) <> "tampered"] do
+      for token <- [
+            nil,
+            "",
+            "tampered",
+            123,
+            %{},
+            [],
+            seal(context, context.params) <> "tampered"
+          ] do
         {:halt, conn} = prepare_post(context, token)
         assert conn.status == 400
         assert conn.halted
@@ -264,10 +272,10 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
 
     test "rejects expired, wrong-secret and signed non-map tokens", context do
       for token <- [
-            Plug.Crypto.sign(Server.signing_secret(), @request_salt, context.params,
+            Plug.Crypto.sign(Server.signing_secret(), @request_salt, bound(context),
               signed_at: System.os_time(:second) - 601
             ),
-            Plug.Crypto.sign("different-test-signing-secret", @request_salt, context.params),
+            Plug.Crypto.sign("different-test-signing-secret", @request_salt, bound(context)),
             sign(["not a request"])
           ] do
         {:halt, conn} = prepare_post(context, token)
@@ -281,7 +289,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
       for conn <- [
             conn(:get, "/oauth/authorize?" <> URI.encode_query(context.params)),
             conn(:post, "/oauth/authorize", %{
-              "consent_request" => sign(context.params),
+              "consent_request" => seal(context, context.params),
               "action" => "approve"
             })
           ] do
@@ -291,6 +299,51 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
         assert conn.status == 401
         assert conn.halted
         assert get_resp_header(conn, "location") == []
+        assert_no_writes()
+      end
+    end
+
+    test "refuses a sealed request rendered for another user or an unbound one", context do
+      other =
+        User
+        |> Ash.Changeset.for_create(:create, %{email: "mallory@example.com"})
+        |> Ash.create!()
+
+      for token <- [
+            seal(%{context | user: other}, context.params),
+            sign(context.params),
+            sign(Map.put(context.params, "sub", nil))
+          ] do
+        {:halt, conn} = prepare_post(context, token)
+        assert conn.status == 400
+        assert get_resp_header(conn, "location") == []
+        assert Jason.decode!(conn.resp_body)["error"] == "invalid_request"
+        assert_no_writes()
+      end
+    end
+
+    test "binds the rendered request to the user and the named session", context do
+      {:ok, conn, request} = prepare_get(context, Server, "session-1")
+      Consent.complete(conn, request, {:render, %{}}, consent_view: RecordingView)
+      assert_received {:consent_assigns, %{consent_request: token}}
+
+      assert {:ok, _conn, _request} = prepare_post(context, token, "approve", Server, "session-1")
+
+      other =
+        User
+        |> Ash.Changeset.for_create(:create, %{email: "mallory@example.com"})
+        |> Ash.create!()
+
+      for {user, session_id} <- [
+            {context.user, "session-2"},
+            {context.user, nil},
+            {other, "session-1"}
+          ] do
+        {:halt, conn} =
+          prepare_post(%{context | user: user}, token, "approve", Server, session_id)
+
+        assert conn.status == 400
+        assert Jason.decode!(conn.resp_body)["error"] == "invalid_request"
         assert_no_writes()
       end
     end
@@ -329,7 +382,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
 
     test "rejects missing and invalid POST decisions after request validation", context do
       for action <- [nil, "", "other", 123] do
-        {:halt, conn} = prepare_post(context, sign(context.params), action)
+        {:halt, conn} = prepare_post(context, seal(context, context.params), action)
         assert conn.status == 400
         assert Jason.decode!(conn.resp_body)["error"] == "invalid_request"
         assert get_resp_header(conn, "location") == []
@@ -457,7 +510,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
           ] do
         for {result, error} <- [
               {prepare_get(%{context | params: params}), get_error},
-              {prepare_post(context, sign(params)), post_error}
+              {prepare_post(context, seal(context, params)), post_error}
             ] do
           assert {:halt, conn} = result
           assert conn.status == 400
@@ -594,7 +647,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "rerenders a prepared POST without granting, issuing or renewing", context do
-      {:ok, conn, request} = prepare_post(context, sign(context.params))
+      {:ok, conn, request} = prepare_post(context, seal(context, context.params))
 
       conn =
         Consent.complete(conn, request, {:render, %{validation_error: "Choose access"}},
@@ -634,7 +687,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
 
     test "completes committed approval without creating or refreshing consent", context do
       {:ok, conn, request} =
-        prepare_post(context, sign(context.params), "approve", RecordingConsentServer)
+        prepare_post(context, seal(context, context.params), "approve", RecordingConsentServer)
 
       consent = Authorize.grant_consent!(Server, context.user, context.client, "mcp")
       conn = Consent.complete(conn, request, :approved, consent_view: RaisingView)
@@ -667,7 +720,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "does not record consent on the application's behalf", context do
-      {:ok, conn, request} = prepare_post(context, sign(context.params))
+      {:ok, conn, request} = prepare_post(context, seal(context, context.params))
       conn = Consent.complete(conn, request, :approved)
       assert conn.status == 302
       assert {:ok, []} = Ash.read(OAuthConsent)
@@ -675,7 +728,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "propagates issuance failures without rolling back committed consent", context do
-      {:ok, conn, request} = prepare_post(context, sign(context.params))
+      {:ok, conn, request} = prepare_post(context, seal(context, context.params))
       consent = Authorize.grant_consent!(Server, context.user, context.client, "mcp")
       request = %{request | user: %{id: "invalid"}}
       assert_raise Ash.Error.Invalid, fn -> Consent.complete(conn, request, :approved) end
@@ -684,7 +737,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "denies without granting, issuing or renewing", context do
-      {:ok, conn, request} = prepare_post(context, sign(context.params), "deny")
+      {:ok, conn, request} = prepare_post(context, seal(context, context.params), "deny")
       conn = Consent.complete(conn, request, :denied, consent_view: RaisingView)
       assert conn.status == 302
       assert conn.halted
@@ -701,7 +754,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
 
     test "returns application errors and omits empty descriptions", context do
       for description <- [nil, "", "Consent could not be saved"] do
-        {:ok, conn, request} = prepare_post(context, sign(context.params))
+        {:ok, conn, request} = prepare_post(context, seal(context, context.params))
 
         conn =
           Consent.complete(conn, request, {:error, "server_error", description},
@@ -725,7 +778,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
     end
 
     test "rejects approving a denied submission and unsupported completion results", context do
-      {:ok, conn, request} = prepare_post(context, sign(context.params), "deny")
+      {:ok, conn, request} = prepare_post(context, seal(context, context.params), "deny")
       assert_raise ArgumentError, fn -> Consent.complete(conn, request, :approved) end
 
       for decision <- [
@@ -744,7 +797,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
       Code.ensure_loaded!(Consent)
 
       for {function, arity} <- [
-            mint_consent_request: 2,
+            mint_consent_request: 3,
             verify_consent_request: 2,
             issue_code_redirect: 2,
             redirect_authorize_error: 5,
@@ -779,7 +832,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
         consent = Authorize.grant_consent!(Server, context.user, client, "mcp")
 
         for decision <- [:approved, :denied, {:error, "server_error", "Could not save consent"}] do
-          {:ok, conn, request} = prepare_post(context, sign(params))
+          {:ok, conn, request} = prepare_post(context, seal(context, params))
           conn = Consent.complete(conn, request, decision)
           assert conn.status == 302
           [location] = get_resp_header(conn, "location")
@@ -900,33 +953,46 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
             {tenant_context("tenant-a"), TenantIssuerServer, "https://tenant-a.example.com"},
             {tenant_context("tenant-b"), TenantIssuerServer, "https://tenant-b.example.com"}
           ] do
-        {:ok, conn, request} = prepare_post(context, sign(context.params), "deny", server)
+        {:ok, conn, request} =
+          prepare_post(context, seal(context, context.params), "deny", server)
+
         conn = Consent.complete(conn, request, :denied)
         assert redirect_query(conn)["iss"] == issuer
       end
     end
   end
 
-  defp prepare_get(context, server \\ Server) do
+  defp prepare_get(context, server \\ Server, session_id \\ nil) do
     conn =
       conn(:get, "/oauth/authorize?" <> Plug.Conn.Query.encode(context.params))
       |> browser(context.user)
       |> Ash.PlugHelpers.set_tenant(Map.get(context, :tenant))
+      |> put_session_id(session_id)
 
     Consent.prepare(conn, oauth2_server: server)
   end
 
-  defp prepare_post(context, token, action \\ "approve", server \\ Server) do
+  defp prepare_post(context, token, action \\ "approve", server \\ Server, session_id \\ nil) do
     conn =
       conn(:post, "/oauth/authorize", %{"consent_request" => token, "action" => action})
       |> browser(context.user)
       |> Ash.PlugHelpers.set_tenant(Map.get(context, :tenant))
+      |> put_session_id(session_id)
 
     Consent.prepare(conn, oauth2_server: server)
   end
 
+  defp put_session_id(conn, nil), do: conn
+  defp put_session_id(conn, session_id), do: Consent.put_session_id(conn, session_id)
+
   defp browser(conn, user), do: conn |> init_test_session(%{}) |> Ash.PlugHelpers.set_actor(user)
   defp sign(payload), do: Plug.Crypto.sign(Server.signing_secret(), @request_salt, payload)
+
+  # A consent request sealed for the context's user, with no session named.
+  defp seal(context, params), do: sign(bound(context, params))
+
+  defp bound(context, params \\ nil),
+    do: Map.merge(params || context.params, %{"sub" => to_string(context.user.id), "sid" => nil})
 
   defp authorize_params(client_id) do
     %{

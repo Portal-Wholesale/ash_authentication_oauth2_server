@@ -14,6 +14,12 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   for the default flow. Custom routers can reuse them while owning their UI,
   application authorization and consent transaction. Session loading and CSRF
   protection remain in the outer browser pipeline.
+
+  The sealed `consent_request` a consent page posts back names the user it was
+  rendered for, and the browser session when the application supplies one with
+  `put_session_id/2`. A POST by any other user or session is refused, so a
+  request sealed for one account cannot be approved from another, even by a
+  same-site attacker who knows the CSRF token.
   """
 
   import Plug.Conn
@@ -25,6 +31,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   @consent_request_salt "ash_authentication_phoenix oauth2_server consent_request v1"
   @consent_request_max_age 600
   @parser_opts Plug.Parsers.init(parsers: [:urlencoded], pass: ["*/*"])
+  @session_id_key :ash_authentication_oauth2_server_session_id
 
   @typedoc """
   Validated request and browser context returned by `prepare/2`.
@@ -78,8 +85,8 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
     server = server!(opts)
 
     case request_params(conn, server) do
-      {:ok, params} ->
-        prepare_request(conn, server, params)
+      {:ok, params, binding} ->
+        prepare_request(conn, server, params, binding)
 
       {:error, :state_too_large} ->
         {:halt, bad_state_html(conn)}
@@ -96,6 +103,16 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   end
 
   def prepare(conn, _opts), do: {:halt, conn |> send_resp(404, "") |> halt()}
+
+  @doc """
+  Name the browser session behind this request, for the outer pipeline to call
+  before `prepare/2`. A consent page rendered with a session id accepts its
+  POST only from the same session. The id is opaque and never shown to the
+  browser in clear.
+  """
+  @spec put_session_id(Plug.Conn.t(), String.t()) :: Plug.Conn.t()
+  def put_session_id(conn, session_id) when is_binary(session_id) and session_id != "",
+    do: put_private(conn, @session_id_key, session_id)
 
   @doc """
   Hand a prepared consent decision back to the default response handling.
@@ -165,18 +182,19 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   end
 
   defp request_params(%Plug.Conn{method: "GET", query_params: params}, _server) do
-    with :ok <- check_state_size(params), do: {:ok, params}
+    with :ok <- check_state_size(params), do: {:ok, params, nil}
   end
 
   defp request_params(conn, server) do
     verify_consent_request(server, Map.get(conn.params, "consent_request"))
   end
 
-  defp prepare_request(conn, server, params) do
+  defp prepare_request(conn, server, params, binding) do
     tenant_opts = tenant_opts(conn)
 
     with {:ok, validated} <- Authorize.validate_request(server, params, tenant_opts),
          {:ok, user} <- require_user(conn),
+         :ok <- check_binding(conn, user, binding),
          :ok <- check_action(conn) do
       {:ok, conn,
        %{
@@ -201,10 +219,30 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
       {:error, :invalid_action} ->
         {:halt, Errors.send_oauth_error(conn, 400, "invalid_request", "missing action")}
 
+      {:error, :foreign_request} ->
+        {:halt,
+         Errors.send_oauth_error(
+           conn,
+           400,
+           "invalid_request",
+           "consent request token missing, invalid, or expired"
+         )}
+
       {:error, code, desc} ->
         {:halt, redirect_authorize_error(conn, server, params, code, desc)}
     end
   end
+
+  # A sealed POST must come from the user, and the session if one was named,
+  # that the consent page was rendered for.
+  defp check_binding(_conn, _user, nil), do: :ok
+
+  defp check_binding(conn, user, binding) do
+    if binding == request_binding(conn, user), do: :ok, else: {:error, :foreign_request}
+  end
+
+  defp request_binding(conn, user),
+    do: %{"sub" => to_string(user.id), "sid" => conn.private[@session_id_key]}
 
   defp check_action(%Plug.Conn{method: "GET"}), do: :ok
 
@@ -340,7 +378,8 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
         resource: validated.resource,
         action_path: conn.request_path,
         csrf_token: get_csrf_token(),
-        consent_request: mint_consent_request(request.server, validated),
+        consent_request:
+          mint_consent_request(request.server, validated, request_binding(conn, request.user)),
         user: request.user,
         tenant: request.tenant
       })
@@ -423,16 +462,18 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   # Bind the user-visible consent UI to the values that drove the code
   # issuance. The token captures everything an attacker might want to
   # silently swap (scope, code_challenge, redirect_uri, state, resource,
-  # client_id) and is verified before the POST is honoured.
-  defp mint_consent_request(server, validated) do
-    payload = %{
-      "client_id" => validated.client.id,
-      "redirect_uri" => validated.redirect_uri,
-      "code_challenge" => validated.code_challenge,
-      "scope" => validated.scope,
-      "state" => validated.state,
-      "resource" => validated.resource
-    }
+  # client_id), and the user and session it was rendered for, and is verified
+  # before the POST is honoured.
+  defp mint_consent_request(server, validated, binding) do
+    payload =
+      Map.merge(binding, %{
+        "client_id" => validated.client.id,
+        "redirect_uri" => validated.redirect_uri,
+        "code_challenge" => validated.code_challenge,
+        "scope" => validated.scope,
+        "state" => validated.state,
+        "resource" => validated.resource
+      })
 
     Plug.Crypto.sign(server.signing_secret(), @consent_request_salt, payload)
   end
@@ -441,8 +482,11 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
     case Plug.Crypto.verify(server.signing_secret(), @consent_request_salt, token,
            max_age: @consent_request_max_age
          ) do
-      {:ok, payload} when is_map(payload) -> {:ok, sealed_params(payload)}
-      _ -> {:error, :invalid}
+      {:ok, %{"sub" => sub} = payload} when is_binary(sub) ->
+        {:ok, sealed_params(payload), %{"sub" => sub, "sid" => Map.get(payload, "sid")}}
+
+      _ ->
+        {:error, :invalid}
     end
   end
 
