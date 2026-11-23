@@ -38,6 +38,9 @@ defmodule Oauth2ServerTest.OAuthClient do
     attribute :token_endpoint_auth_method, :string, public?: true, default: "none"
     attribute :scope, :string, public?: true, default: "mcp"
     attribute :cimd_url, :string, public?: true
+    attribute :jwks_uri, :string, public?: true
+    attribute :jwks, :map, public?: true
+    attribute :token_endpoint_auth_signing_alg, :string, public?: true
     attribute :last_used_at, :utc_datetime_usec, public?: true
     create_timestamp :inserted_at
     update_timestamp :updated_at
@@ -68,7 +71,10 @@ defmodule Oauth2ServerTest.OAuthClient do
         :grant_types,
         :response_types,
         :token_endpoint_auth_method,
-        :scope
+        :scope,
+        :jwks_uri,
+        :jwks,
+        :token_endpoint_auth_signing_alg
       ]
     end
 
@@ -237,6 +243,8 @@ defmodule Oauth2ServerTest.Domain do
     resource Oauth2ServerTest.OAuthAuthorizationCode
     resource Oauth2ServerTest.OAuthRefreshToken
     resource Oauth2ServerTest.OAuthConsent
+    resource Oauth2ServerTest.OAuthClientAssertion
+    resource Oauth2ServerTest.FailingClientAssertion
   end
 end
 
@@ -455,6 +463,103 @@ defmodule Oauth2ServerTest.CimdServer do
     dcr_enabled?: true,
     cimd_enabled?: true,
     cimd_fetcher: Oauth2ServerTest.StubFetcher
+end
+
+defmodule Oauth2ServerTest.OAuthClientAssertion do
+  @moduledoc false
+  # The ETS data layer does not enforce identities, so the pre-check does.
+  use Ash.Resource,
+    domain: Oauth2ServerTest.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    uuid_v7_primary_key :id
+    attribute :client_id, :uuid, public?: true, allow_nil?: false
+    attribute :jti, :string, public?: true, allow_nil?: false
+    attribute :expires_at, :utc_datetime, public?: true, allow_nil?: false
+  end
+
+  actions do
+    defaults [:read, :destroy]
+    create :record, accept: [:client_id, :jti, :expires_at]
+  end
+
+  identities do
+    identity :unique_jti, [:client_id, :jti], pre_check_with: Oauth2ServerTest.Domain
+  end
+end
+
+defmodule Oauth2ServerTest.FailingClientAssertion do
+  @moduledoc false
+  # A `jti` store whose writes fail the way an unavailable database does.
+  use Ash.Resource,
+    domain: Oauth2ServerTest.Domain,
+    data_layer: Ash.DataLayer.Ets
+
+  attributes do
+    uuid_v7_primary_key :id
+    attribute :client_id, :uuid, public?: true, allow_nil?: false
+    attribute :jti, :string, public?: true, allow_nil?: false
+    attribute :expires_at, :utc_datetime, public?: true, allow_nil?: false
+  end
+
+  actions do
+    defaults [:read, :destroy]
+
+    create :record do
+      accept [:client_id, :jti, :expires_at]
+
+      change fn changeset, _context ->
+        Ash.Changeset.add_error(
+          changeset,
+          Ash.Error.Unknown.UnknownError.exception(error: "connection refused")
+        )
+      end
+    end
+  end
+end
+
+defmodule Oauth2ServerTest.PrivateKeyJwtServer do
+  @moduledoc """
+  `Oauth2ServerTest.CimdServer` with `private_key_jwt` turned on for CIMD
+  clients.
+  """
+
+  use AshAuthentication.Oauth2Server,
+    otp_app: :ash_authentication_oauth2_server,
+    user_resource: Oauth2ServerTest.User,
+    issuer_url: {Oauth2ServerTest.Secrets, []},
+    resource_url: {Oauth2ServerTest.Secrets, []},
+    signing_secret: {Oauth2ServerTest.Secrets, []},
+    client_resource: Oauth2ServerTest.OAuthClient,
+    authorization_code_resource: Oauth2ServerTest.OAuthAuthorizationCode,
+    refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
+    consent_resource: Oauth2ServerTest.OAuthConsent,
+    scopes: ["mcp"],
+    cimd_enabled?: true,
+    cimd_fetcher: Oauth2ServerTest.StubFetcher,
+    client_assertion_resource: Oauth2ServerTest.OAuthClientAssertion
+end
+
+defmodule Oauth2ServerTest.FailingJtiServer do
+  @moduledoc """
+  `Oauth2ServerTest.PrivateKeyJwtServer` whose `jti` store cannot be written.
+  """
+
+  use AshAuthentication.Oauth2Server,
+    otp_app: :ash_authentication_oauth2_server,
+    user_resource: Oauth2ServerTest.User,
+    issuer_url: {Oauth2ServerTest.Secrets, []},
+    resource_url: {Oauth2ServerTest.Secrets, []},
+    signing_secret: {Oauth2ServerTest.Secrets, []},
+    client_resource: Oauth2ServerTest.OAuthClient,
+    authorization_code_resource: Oauth2ServerTest.OAuthAuthorizationCode,
+    refresh_token_resource: Oauth2ServerTest.OAuthRefreshToken,
+    consent_resource: Oauth2ServerTest.OAuthConsent,
+    scopes: ["mcp"],
+    cimd_enabled?: true,
+    cimd_fetcher: Oauth2ServerTest.StubFetcher,
+    client_assertion_resource: Oauth2ServerTest.FailingClientAssertion
 end
 
 defmodule Oauth2ServerTest.ScopeProvider do

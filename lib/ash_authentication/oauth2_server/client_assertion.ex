@@ -105,7 +105,8 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
 
   Returns `:ok`, `{:error, :unsupported_client_authentication}` for a public
   client that sent credentials, `{:error, :invalid_request}` for more than one
-  credential, or `{:error, :invalid_client_assertion}`.
+  credential, `{:error, :invalid_client_assertion}`, or `{:error, :server_error}`
+  when the assertion's `jti` could not be recorded.
   """
   @spec authenticate(module(), Ash.Resource.Record.t(), String.t(), map(), keyword()) ::
           :ok | {:error, atom()}
@@ -292,11 +293,34 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
     |> Ash.Changeset.for_create(:record, attrs)
     |> Ash.create(ash_opts(opts))
     |> case do
-      {:ok, _} -> :ok
-      # A replayed `jti` hits the unique identity.
-      {:error, _} -> {:error, :invalid_client_assertion}
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        # Only a replayed `jti`, which hits the unique identity, is the
+        # client's fault. Any other failure leaves the assertion unrecorded,
+        # so it must not be accepted, and it is not the client's error either.
+        if unique_violation?(error) do
+          {:error, :invalid_client_assertion}
+        else
+          Logger.error("Oauth2Server: failed to record client assertion jti: #{inspect(error)}")
+          {:error, :server_error}
+        end
     end
   end
+
+  # A data layer that enforces the identity reports a unique constraint
+  # (AshPostgres); the identity pre-check reports the identity's fields.
+  defp unique_violation?(%Ash.Error.Invalid{errors: errors}),
+    do: Enum.any?(errors, &unique_violation?/1)
+
+  defp unique_violation?(%Ash.Error.Changes.InvalidAttribute{private_vars: vars}),
+    do: is_list(vars) and Keyword.get(vars, :constraint_type) == :unique
+
+  defp unique_violation?(%Ash.Error.Changes.InvalidChanges{fields: fields}),
+    do: :jti in List.wrap(fields)
+
+  defp unique_violation?(_), do: false
 
   defp peek_header(token) do
     with [h, _, _] <- String.split(token, "."),
