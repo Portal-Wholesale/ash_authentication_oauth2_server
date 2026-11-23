@@ -65,7 +65,13 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   @doc """
   Prepare a GET or POST consent request for application-owned handling.
 
-  `opts` requires the `:oauth2_server` configuration module. Parses URL-encoded
+  `opts` requires the `:oauth2_server` configuration module. `:redirect_error?`,
+  a function of the connection and the resolved client, decides whether a
+  request error found here goes back to the client's redirect URI; when it
+  returns false, the error is answered directly, as for an unknown client.
+  It defaults to always redirecting. An application that resolves clients
+  from URLs (CIMD) can use it to keep its origin from redirecting to a client
+  the user never approved (RFC 9700 §4.11.2). Parses URL-encoded
   requests with the default parser limits, checks GET state size, verifies and
   reconstructs sealed POST protocol fields, and validates the request with the
   browser connection's current Ash tenant. Requires its authenticated actor
@@ -86,7 +92,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
 
     case request_params(conn, server) do
       {:ok, params, binding} ->
-        prepare_request(conn, server, params, binding)
+        prepare_request(conn, server, params, binding, opts)
 
       {:error, :state_too_large} ->
         {:halt, bad_state_html(conn)}
@@ -189,7 +195,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
     verify_consent_request(server, Map.get(conn.params, "consent_request"))
   end
 
-  defp prepare_request(conn, server, params, binding) do
+  defp prepare_request(conn, server, params, binding, opts) do
     tenant_opts = tenant_opts(conn)
 
     with {:ok, validated} <- Authorize.validate_request(server, params, tenant_opts),
@@ -229,7 +235,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
          )}
 
       {:error, code, desc} ->
-        {:halt, redirect_authorize_error(conn, server, params, code, desc)}
+        {:halt, redirect_authorize_error(conn, server, params, code, desc, opts)}
     end
   end
 
@@ -289,22 +295,25 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.Consent do
   # error responses MUST go back via 302 with `error`, `error_description`,
   # and `state` so the client can surface the failure to the end user.
   # `Authorize.error_redirect_uri/3` applies the same exact match as a
-  # successful request. Without a valid target the error goes to the user
-  # agent directly (OAuth 2.1 §4.1.2.1).
-  defp redirect_authorize_error(conn, server, params, code, desc) do
-    case Authorize.error_redirect_uri(server, params, tenant_opts(conn)) do
-      {:ok, redirect_uri} ->
-        redirect_with_oauth_error(
-          conn,
-          server,
-          redirect_uri,
-          Map.get(params, "state"),
-          code,
-          desc
-        )
+  # successful request. Without a valid target, or when the application's
+  # `:redirect_error?` declines the client, the error goes to the user agent
+  # directly (OAuth 2.1 §4.1.2.1).
+  defp redirect_authorize_error(conn, server, params, code, desc, opts) do
+    redirect_error? = Keyword.get(opts, :redirect_error?, fn _conn, _client -> true end)
 
-      :error ->
-        Errors.send_oauth_error(conn, 400, code, desc)
+    with {:ok, client, redirect_uri} <-
+           Authorize.error_redirect_target(server, params, tenant_opts(conn)),
+         true <- redirect_error?.(conn, client) do
+      redirect_with_oauth_error(
+        conn,
+        server,
+        redirect_uri,
+        Map.get(params, "state"),
+        code,
+        desc
+      )
+    else
+      _ -> Errors.send_oauth_error(conn, 400, code, desc)
     end
   end
 

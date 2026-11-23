@@ -445,6 +445,39 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
       assert_no_writes()
     end
 
+    test "answers a protocol error directly when redirect_error? declines the client",
+         context do
+      params = Map.put(context.params, "scope", "not-advertised")
+      test_pid = self()
+
+      decide = fn answer ->
+        fn conn, client ->
+          send(test_pid, {:asked, Ash.PlugHelpers.get_actor(conn).id, client.id})
+          answer
+        end
+      end
+
+      conn =
+        conn(:get, "/oauth/authorize?" <> Plug.Conn.Query.encode(params))
+        |> browser(context.user)
+
+      {:halt, declined} =
+        Consent.prepare(conn, oauth2_server: Server, redirect_error?: decide.(false))
+
+      assert declined.status == 400
+      assert get_resp_header(declined, "location") == []
+      assert Jason.decode!(declined.resp_body)["error"] == "invalid_scope"
+      assert_received {:asked, user_id, client_id}
+      assert {user_id, client_id} == {context.user.id, context.client.id}
+
+      {:halt, allowed} =
+        Consent.prepare(conn, oauth2_server: Server, redirect_error?: decide.(true))
+
+      assert allowed.status == 302
+      assert redirect_query(allowed)["error"] == "invalid_scope"
+      assert_no_writes()
+    end
+
     test "responds directly for unknown clients and unsafe or incomplete redirects", context do
       for params <- [
             Map.put(context.params, "client_id", Ash.UUIDv7.generate()),
@@ -800,7 +833,7 @@ defmodule AshAuthentication.Phoenix.Oauth2Server.ConsentTest do
             mint_consent_request: 3,
             verify_consent_request: 2,
             issue_code_redirect: 2,
-            redirect_authorize_error: 5,
+            redirect_authorize_error: 6,
             redirect_with_oauth_error: 6,
             sign_in_redirect: 2
           ] do

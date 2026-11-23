@@ -123,9 +123,22 @@ defmodule AshAuthentication.Oauth2Server.Authorize do
   @spec error_redirect_uri(server :: module(), params :: map(), opts()) ::
           {:ok, String.t()} | :error
   def error_redirect_uri(server, params, opts \\ []) do
+    case error_redirect_target(server, params, opts) do
+      {:ok, _client, redirect_uri} -> {:ok, redirect_uri}
+      :error -> :error
+    end
+  end
+
+  @doc """
+  As `error_redirect_uri/3`, but also returns the client the URI belongs to,
+  for a caller that decides per client whether to redirect at all.
+  """
+  @spec error_redirect_target(server :: module(), params :: map(), opts()) ::
+          {:ok, Ash.Resource.Record.t(), String.t()} | :error
+  def error_redirect_target(server, params, opts \\ []) do
     with {:ok, client} <- find_client(server, params["client_id"], opts),
          {:ok, redirect_uri} <- resolve_redirect_uri(params, client) do
-      {:ok, redirect_uri}
+      {:ok, client, redirect_uri}
     else
       _ -> :error
     end
