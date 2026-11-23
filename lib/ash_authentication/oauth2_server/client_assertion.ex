@@ -72,8 +72,11 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
 
   def put_client_id(%{"client_assertion" => assertion} = params) when is_binary(assertion) do
     case peek_claims(assertion) do
-      {:ok, %{"iss" => iss}} when is_binary(iss) and iss != "" -> Map.put(params, "client_id", iss)
-      _ -> params
+      {:ok, %{"iss" => iss}} when is_binary(iss) and iss != "" ->
+        Map.put(params, "client_id", iss)
+
+      _ ->
+        params
     end
   end
 
@@ -108,8 +111,11 @@ defmodule AshAuthentication.Oauth2Server.ClientAssertion do
           :ok | {:error, atom()}
   def authenticate(server, client, presented_client_id, params, opts) do
     case Map.get(client, :token_endpoint_auth_method) do
-      "private_key_jwt" -> authenticate_assertion(server, client, presented_client_id, params, opts)
-      _ -> no_credentials(params, opts)
+      "private_key_jwt" ->
+        authenticate_assertion(server, client, presented_client_id, params, opts)
+
+      _ ->
+        no_credentials(params, opts)
     end
   end
 
