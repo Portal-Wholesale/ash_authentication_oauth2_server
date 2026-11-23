@@ -104,6 +104,35 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
 
       assert {:ok, verified} = Jwt.verify(TestServer, token)
       assert verified["sub"] == "user-123"
+      assert {:ok, %{"alg" => "HS256", "typ" => "at+jwt"}} = Joken.peek_header(token)
+    end
+
+    test "a token of another type is refused, whatever its claims and key (RFC 9068 §4)" do
+      {:ok, _, claims} = Jwt.mint(TestServer, sub: "u1", client_id: "c1", scope: "mcp")
+      secret = TestServer.signing_secret()
+
+      for headers <- [%{}, %{"typ" => "JWT"}, %{"typ" => "client-authentication+jwt"}] do
+        # Joken adds `typ: JWT` unless the header names one.
+        {:ok, token, _} =
+          Joken.encode_and_sign(claims, Joken.Signer.create("HS256", secret, headers))
+
+        assert {:error, :invalid_token_type} = Jwt.verify(TestServer, token)
+      end
+
+      no_typ =
+        JOSE.JWK.from_oct(secret)
+        |> JOSE.JWT.sign(%{"alg" => "HS256"}, claims)
+        |> JOSE.JWS.compact()
+        |> elem(1)
+
+      assert {:error, :invalid_token_type} = Jwt.verify(TestServer, no_typ)
+
+      for typ <- ["AT+JWT", "application/at+jwt"] do
+        {:ok, token, _} =
+          Joken.encode_and_sign(claims, Joken.Signer.create("HS256", secret, %{"typ" => typ}))
+
+        assert {:ok, _} = Jwt.verify(TestServer, token)
+      end
     end
 
     test "tokens with the wrong audience are rejected" do
@@ -114,14 +143,14 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
         Jwt.mint(TestServer, sub: "u1", client_id: "c1", scope: "mcp")
 
       tampered = %{claims | "aud" => "https://attacker.example.com"}
-      signer = Joken.Signer.create("HS256", TestServer.signing_secret())
+      signer = access_token_signer(TestServer.signing_secret())
       {:ok, bad_token, _} = Joken.encode_and_sign(tampered, signer)
 
       assert {:error, :invalid_audience} = Jwt.verify(TestServer, bad_token)
     end
 
     test "tokens signed with a different secret are rejected" do
-      bad_signer = Joken.Signer.create("HS256", "different-secret-different-secret")
+      bad_signer = access_token_signer("different-secret-different-secret")
 
       claims = %{
         "iss" => TestServer.issuer_url(),
@@ -143,7 +172,7 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
         "exp" => System.system_time(:second) - 120
       }
 
-      signer = Joken.Signer.create("HS256", TestServer.signing_secret())
+      signer = access_token_signer(TestServer.signing_secret())
       {:ok, expired, _} = Joken.encode_and_sign(claims, signer)
 
       assert {:error, :expired} = Jwt.verify(TestServer, expired)
@@ -158,7 +187,7 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
         "exp" => System.system_time(:second) - 5
       }
 
-      signer = Joken.Signer.create("HS256", TestServer.signing_secret())
+      signer = access_token_signer(TestServer.signing_secret())
       {:ok, slightly_expired, _} = Joken.encode_and_sign(claims, signer)
 
       assert {:ok, _} = Jwt.verify(TestServer, slightly_expired)
@@ -173,7 +202,7 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
         "exp" => System.system_time(:second) + 300
       }
 
-      signer = Joken.Signer.create("HS256", TestServer.signing_secret())
+      signer = access_token_signer(TestServer.signing_secret())
       {:ok, future_token, _} = Joken.encode_and_sign(claims, signer)
 
       assert {:error, :not_yet_valid} = Jwt.verify(TestServer, future_token)
@@ -188,7 +217,7 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
         "exp" => System.system_time(:second) + 300
       }
 
-      signer = Joken.Signer.create("HS256", TestServer.signing_secret())
+      signer = access_token_signer(TestServer.signing_secret())
       {:ok, edge_token, _} = Joken.encode_and_sign(claims, signer)
 
       assert {:ok, _} = Jwt.verify(TestServer, edge_token)
@@ -298,4 +327,7 @@ defmodule AshAuthentication.Oauth2Server.SmokeTest do
                "tok"
     end
   end
+
+  defp access_token_signer(secret),
+    do: Joken.Signer.create("HS256", secret, %{"typ" => "at+jwt"})
 end

@@ -26,6 +26,9 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
   """
 
   @signer_alg "HS256"
+  # RFC 9068 §2.1: an access token names its type, so a resource server can
+  # tell it from any other JWT signed with the same key.
+  @token_type "at+jwt"
 
   @doc """
   Mint a new access token.
@@ -75,7 +78,10 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
       |> Map.drop(["tenant"])
       |> Map.merge(claims)
 
-    signer = Joken.Signer.create(@signer_alg, server.signing_secret(secret_context))
+    signer =
+      Joken.Signer.create(@signer_alg, server.signing_secret(secret_context), %{
+        "typ" => @token_type
+      })
 
     case Joken.encode_and_sign(claims, signer) do
       {:ok, token, _} -> {:ok, token, claims}
@@ -100,7 +106,11 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
   end
 
   @doc """
-  Verify a token's signature, issuer, audience, expiry, and not-before.
+  Verify a token's type, signature, issuer, audience, expiry, and not-before.
+
+  The `typ` header must be `at+jwt` (or `application/at+jwt`), as RFC 9068 §4
+  requires of a resource server, so a JWT minted for another purpose never
+  verifies as an access token, whatever key signed it.
 
   Per RFC 7519 §4.1.4 we allow a small leeway on `exp` and `nbf` (the
   server-configured `clock_skew_seconds`, default 30s) so tokens minted
@@ -122,7 +132,8 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
     signer = Joken.Signer.create(@signer_alg, server.signing_secret())
     skew = server.clock_skew_seconds()
 
-    with {:ok, claims} <- Joken.verify(token, signer),
+    with :ok <- check_typ(token),
+         {:ok, claims} <- Joken.verify(token, signer),
          secret_context <- secret_context(claims["tenant"]),
          :ok <- check_iss(claims, server, secret_context),
          :ok <- check_aud(claims, server, opts[:resource], secret_context),
@@ -133,6 +144,23 @@ defmodule AshAuthentication.Oauth2Server.Jwt do
   end
 
   def verify(_, _, _), do: {:error, :invalid_token}
+
+  # Media types are case-insensitive and may carry the `application/` prefix
+  # (RFC 7515 §4.1.9).
+  defp check_typ(token) do
+    case Joken.peek_header(token) do
+      {:ok, %{"typ" => typ}} when is_binary(typ) ->
+        if String.downcase(typ) in [@token_type, "application/" <> @token_type],
+          do: :ok,
+          else: {:error, :invalid_token_type}
+
+      {:ok, _header} ->
+        {:error, :invalid_token_type}
+
+      _ ->
+        {:error, :invalid_token}
+    end
+  end
 
   defp check_iss(%{"iss" => iss}, server, secret_context) do
     if iss == server.issuer_url(secret_context), do: :ok, else: {:error, :invalid_issuer}
