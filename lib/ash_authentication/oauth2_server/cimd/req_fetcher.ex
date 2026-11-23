@@ -23,6 +23,8 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
       while keeping TLS verification, SNI, and the `Host` header on the
       original hostname (Mint's `:hostname` option). This closes the
       DNS-rebinding window between "resolve and check" and "connect".
+      Each fetch opens its own connection and closes it afterwards, so an
+      unbounded set of client hostnames starts no pools and creates no atoms.
     * **No redirects** — a redirect response is an error. A compliant
       CIMD document is served directly at its `client_id` URL.
     * **Bounded response** — the body is capped at `:max_body_bytes`
@@ -206,26 +208,34 @@ defmodule AshAuthentication.Oauth2Server.CIMD.ReqFetcher do
 
   # ── the request itself ─────────────────────────────────────────────────────
 
-  defp do_fetch(uri, ip, opts) do
+  defp do_fetch(uri, ip, opts), do: get(pinned_url(uri, ip), uri.host, deadline(opts), opts)
+
+  @doc false
+  def deadline(_opts), do: nil
+
+  @doc false
+  def get(url, hostname, _deadline, opts) do
     max_body = Keyword.get(opts, :max_body_bytes, @default_max_body_bytes)
 
     request =
       Req.new(
-        url: pinned_url(uri, ip),
+        url: url,
         headers: [{"accept", "application/json"}],
-        connect_options: [
-          # Connect to the validated IP, but keep TLS verification, SNI,
-          # and the Host header on the original hostname.
-          hostname: uri.host,
-          timeout: Keyword.get(opts, :connect_timeout, @default_timeout)
-        ],
-        receive_timeout: Keyword.get(opts, :receive_timeout, @default_timeout),
+        # One connection per fetch, closed after it; see `Adapter`.
+        adapter: __MODULE__.Adapter,
         redirect: false,
         retry: false,
         # Raw body collection with a size cap — decoding happens below so
         # an oversized response never accumulates in memory.
         into: body_limiter(max_body)
       )
+      |> Req.Request.put_private(:cimd_fetch, %{
+        # Connect to the validated IP, but keep TLS verification, SNI,
+        # and the Host header on the original hostname.
+        hostname: hostname,
+        connect_timeout: Keyword.get(opts, :connect_timeout, @default_timeout),
+        receive_timeout: Keyword.get(opts, :receive_timeout, @default_timeout)
+      })
 
     case Req.request(request) do
       {:ok, %{status: 200} = response} ->
