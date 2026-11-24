@@ -403,7 +403,8 @@ defmodule AshAuthentication.Oauth2Server.Token do
              resource_uri: old_row.resource_uri,
              expires_at: new_expires_at
            })
-           |> Ash.create(ash_opts(opts)),
+           |> Ash.create(ash_opts(opts))
+           |> issued_or_error(:revoked),
          {:ok, access_token, _claims} <-
            Jwt.mint(server,
              sub: old_row.user_id,
@@ -557,10 +558,10 @@ defmodule AshAuthentication.Oauth2Server.Token do
   defp resource_urls(server, secret_context),
     do: Enum.map(server.resources(), &server.resource_url(&1, secret_context))
 
-  # On reuse detection, revoke every refresh token in the chain in a
-  # single filtered UPDATE. RFC 6749 §4.3.1. Every row in a rotation
-  # lineage carries the same `chain_id` (set at initial issuance,
-  # inherited on rotation), so one filtered UPDATE clears them all.
+  # On reuse detection, revoke every refresh token in the chain by its
+  # `chain_id`. RFC 6749 §4.3.1. Every row in a rotation lineage carries the
+  # same `chain_id` (set at initial issuance, inherited on rotation), so a
+  # filtered UPDATE clears them all.
   defp revoke_chain_by_hash(server, hash, opts) do
     case find_refresh(server, hash, opts) do
       {:ok, row} ->
@@ -575,17 +576,24 @@ defmodule AshAuthentication.Oauth2Server.Token do
     end
   end
 
+  # One UPDATE per pass, repeated until a pass revokes nothing. A pass that
+  # waits on a token a concurrent rotation holds revokes it once the rotation
+  # commits, but cannot see the child the rotation inserted; the next pass
+  # does. A revoked row never matches again, so the loop ends.
   defp revoke_chain_by_id(server, chain_id, opts) do
     bulk_opts =
-      [return_records?: false, return_errors?: true, notify?: false]
+      [return_records?: true, return_errors?: true, notify?: false]
       |> Keyword.merge(ash_opts(opts))
 
     server.refresh_token_resource()
     |> Ash.Query.filter(chain_id == ^chain_id and is_nil(revoked_at))
     |> Ash.bulk_update(:revoke, %{}, bulk_opts)
     |> case do
-      %Ash.BulkResult{status: :success} ->
+      %Ash.BulkResult{status: :success, records: []} ->
         :ok
+
+      %Ash.BulkResult{status: :success} ->
+        revoke_chain_by_id(server, chain_id, opts)
 
       %Ash.BulkResult{status: status, errors: errors} ->
         Logger.warning(
@@ -619,11 +627,31 @@ defmodule AshAuthentication.Oauth2Server.Token do
       expires_at: expires_at
     })
     |> Ash.create(ash_opts(opts))
+    |> issued_or_error(:invalid_code)
     |> case do
       {:ok, _} -> {:ok, raw}
-      {:error, _} -> {:error, :refresh_create_failed}
+      error -> error
     end
   end
+
+  # A validation on the resource's `:issue` action may refuse a token, for
+  # example when the grant was revoked after the code was issued or between
+  # a rotation's rotate and issue. The grant is then invalid, `invalid_grant`
+  # (RFC 6749 §5.2), with `refused` as the reason. Any other failure, such as
+  # a missing tenant, is a server fault.
+  defp issued_or_error({:ok, _} = ok, _refused), do: ok
+
+  defp issued_or_error({:error, %Ash.Error.Invalid{errors: [_ | _] = errors}}, refused) do
+    if Enum.all?(errors, &validation_error?/1),
+      do: {:error, refused},
+      else: {:error, :refresh_create_failed}
+  end
+
+  defp issued_or_error({:error, _}, _refused), do: {:error, :refresh_create_failed}
+
+  defp validation_error?(%Ash.Error.Changes.InvalidAttribute{}), do: true
+  defp validation_error?(%Ash.Error.Changes.InvalidChanges{}), do: true
+  defp validation_error?(_error), do: false
 
   defp generate_refresh do
     raw = :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
